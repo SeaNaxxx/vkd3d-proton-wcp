@@ -12,7 +12,6 @@ Detection uses Vulkan vendorID to identify Qualcomm and deviceID to identify gen
 
 All Adreno GPUs share the Qualcomm vendorID 0x5143.
 Tiled rendering optimizations apply to all generations.
-QCOM_render_pass_shader_resolve is enabled on A7xx and A8xx only.
 
 ## Adreno detection
 
@@ -25,7 +24,6 @@ QCOM_render_pass_shader_resolve is enabled on A7xx and A8xx only.
 - File: `libs/vkd3d/device.c`
 - Aliases the transfer queue family to the compute queue family on Adreno to avoid transfer-only queue paths.
 - Removes Turnip from the relaxed load/store compatibility path.
-- Enables the QCOM render-pass shader resolve capability only when the Adreno vendorID path and the device extension are both present.
 - Upstream references: issue #2950, PR #2915.
 
 ## Integer blend handling
@@ -62,5 +60,5 @@ QCOM_render_pass_shader_resolve is enabled on A7xx and A8xx only.
 ## Vulkan profile
 
 - File: `VP_D3D12_VKD3D_PROTON_profile.json`
-- Adds an optional Adreno capability block for QCOM shader resolve, fragment shader interlock, fragment shading rate, and Qualcomm vendorID matching.
+- Adds an optional Adreno capability block for fragment shader interlock, fragment shading rate, and Qualcomm vendorID matching.
 - Upstream reference: local profile extension.

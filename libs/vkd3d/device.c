@@ -94,7 +94,6 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(KHR_PRESENT_ID_2, KHR_present_id2),
     VK_EXTENSION(KHR_PRESENT_WAIT_2, KHR_present_wait2),
     VK_EXTENSION(EXT_PRESENT_TIMING, EXT_present_timing),
-    VK_EXTENSION(QCOM_RENDER_PASS_SHADER_RESOLVE, QCOM_render_pass_shader_resolve),
 #ifdef _WIN32
     VK_EXTENSION(KHR_EXTERNAL_MEMORY_WIN32, KHR_external_memory_win32),
     VK_EXTENSION(KHR_EXTERNAL_SEMAPHORE_WIN32, KHR_external_semaphore_win32),
@@ -3846,18 +3845,6 @@ static void d3d12_device_init_workarounds(struct d3d12_device *device)
         case VK_DRIVER_ID_VULKAN_SC_EMULATION_ON_VULKAN:
         default:
             break;
-    }
-
-    {
-        uint32_t vendor_id = device->device_info.properties2.properties.vendorID;
-        uint32_t device_id = device->device_info.properties2.properties.deviceID;
-
-        if (vkd3d_is_adreno_a7xx(vendor_id, device_id) ||
-            vkd3d_is_adreno_a8xx(vendor_id, device_id))
-        {
-            device->vk_info.has_render_pass_shader_resolve =
-                device->vk_info.QCOM_render_pass_shader_resolve;
-        }
     }
 
     /* For testing purposes, allow us to exercise all code paths on all GPUs. */
