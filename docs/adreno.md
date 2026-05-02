@@ -1,11 +1,23 @@
 # Adreno optimizations
 
-This branch adds runtime-gated Adreno paths for Qualcomm Adreno 750 with Turnip on Android emulator stacks.
+This branch adds runtime-gated Adreno paths for Qualcomm Adreno A6xx/A7xx/A8xx generations with Turnip on Android emulator stacks.
+
+## GPU detection
+
+Detection uses Vulkan vendorID to identify Qualcomm and deviceID to identify generation.
+
+- A6xx: 0x0600 – 0x06FF (Adreno 610, 618, 620, 630, 640, 650, 660, 680, 690)
+- A7xx: 0x0700 – 0x07FF (Adreno 710, 720, 725, 730, 735, 740, 750)
+- A8xx: 0x0800 – 0x08FF (Adreno 810, 825, 829, 830, 840)
+
+All Adreno GPUs share the Qualcomm vendorID 0x5143.
+Tiled rendering optimizations apply to all generations.
+QCOM_render_pass_shader_resolve is enabled on A7xx and A8xx only.
 
 ## Adreno detection
 
 - File: `libs/vkd3d/adreno_quirks.h`
-- Adds Qualcomm and Adreno 750 identifiers and a vendorID predicate for Adreno runtime checks.
+- Adds Qualcomm vendorID constant and range-based A6xx/A7xx/A8xx deviceID predicates plus a tiler predicate for Adreno runtime checks.
 - Upstream reference: local fork integration point.
 
 ## Device queue and render-pass behavior

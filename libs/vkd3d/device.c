@@ -3848,8 +3848,17 @@ static void d3d12_device_init_workarounds(struct d3d12_device *device)
             break;
     }
 
-    if (vkd3d_is_adreno(device->device_info.properties2.properties.vendorID))
-        device->vk_info.has_render_pass_shader_resolve = device->vk_info.QCOM_render_pass_shader_resolve;
+    {
+        uint32_t vendor_id = device->device_info.properties2.properties.vendorID;
+        uint32_t device_id = device->device_info.properties2.properties.deviceID;
+
+        if (vkd3d_is_adreno_a7xx(vendor_id, device_id) ||
+            vkd3d_is_adreno_a8xx(vendor_id, device_id))
+        {
+            device->vk_info.has_render_pass_shader_resolve =
+                device->vk_info.QCOM_render_pass_shader_resolve;
+        }
+    }
 
     /* For testing purposes, allow us to exercise all code paths on all GPUs. */
     if (vkd3d_debug_control_get_behavior_flags() & VKD3D_DEBUG_CONTROL_BEHAVIOR_ENABLE_TILER_SYNC)
