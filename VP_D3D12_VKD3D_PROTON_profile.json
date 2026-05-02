@@ -640,6 +640,23 @@
                 }
             }
         },
+        "optional_adreno": {
+            "extensions": {
+                "VK_QCOM_render_pass_shader_resolve": 1,
+                "VK_EXT_fragment_shader_interlock": 1,
+                "VK_KHR_fragment_shading_rate": 1
+            },
+            "features": {
+                "VkPhysicalDeviceFragmentShadingRateFeaturesKHR": {
+                    "attachmentFragmentShadingRate": true
+                }
+            },
+            "properties": {
+                "VkPhysicalDeviceProperties": {
+                    "vendorID": 20803
+                }
+            }
+        },
         "optional_nv": {
             "extensions": {
                 "VK_EXT_pageable_device_local_memory": 1,
