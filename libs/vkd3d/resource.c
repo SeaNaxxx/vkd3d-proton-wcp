@@ -22,6 +22,7 @@
 #include <float.h>
 #include <math.h>
 
+#include "adreno_quirks.h"
 #include "vkd3d_private.h"
 #include "vkd3d_d3dkmt.h"
 #include "vkd3d_rw_spinlock.h"
@@ -2897,6 +2898,12 @@ static bool d3d12_resource_supports_small_resource_alignment(const D3D12_RESOURC
     return estimated_size <= D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
 }
 
+static inline UINT64 vkd3d_clamp_placement_alignment(UINT64 a)
+{
+    return (a && a < D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+            ? (UINT64)D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT : a;
+}
+
 static bool d3d12_resource_validate_texture_alignment(const D3D12_RESOURCE_DESC1 *desc,
         const struct vkd3d_format *format)
 {
@@ -3056,6 +3063,7 @@ HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc,
     const struct vkd3d_format *format;
     unsigned int i;
     HRESULT hr;
+    UINT64 alignment;
 
     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->SampleDesc.Count > 1)
     {
@@ -3114,17 +3122,20 @@ HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc,
     switch (desc->Dimension)
     {
         case D3D12_RESOURCE_DIMENSION_BUFFER:
+            alignment = vkd3d_clamp_placement_alignment(desc->Alignment);
+
             if (desc->MipLevels != 1)
             {
                 WARN("Invalid miplevel count %u for buffer.\n", desc->MipLevels);
                 return E_INVALIDARG;
             }
 
-            if (desc->Alignment != 0 && desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+            if (alignment != 0 && alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
             {
                 WARN("Invalid alignment %"PRIu64" for buffer resource. Must be 0 or D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT.\n",
                         desc->Alignment);
-                return E_INVALIDARG;
+                if (!vkd3d_is_adreno(device->device_info.properties2.properties.vendorID))
+                    return E_INVALIDARG;
             }
 
             if (desc->Format != DXGI_FORMAT_UNKNOWN || desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR
