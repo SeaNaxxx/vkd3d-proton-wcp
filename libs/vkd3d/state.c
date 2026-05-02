@@ -4406,11 +4406,15 @@ static HRESULT d3d12_pipeline_state_validate_blend_state(struct d3d12_pipeline_s
             {
                 if (sig->elements[j].register_index == i)
                 {
-                    ERR("Enabling blending on RT %u with format %s, but using integer format is not supported.\n", i,
+                    WARN("Force-disabling blending on RT %u (integer format %s), preventing GPU hang.\n", i,
                             debug_dxgi_format(desc->rtv_formats.RTFormats[i]));
-                    return E_INVALIDARG;
+                    state->graphics.blend_attachments[i].blendEnable = VK_FALSE;
+                    break;
                 }
             }
+
+            if (j < sig->element_count)
+                continue;
 
             /* The output does not exist, but we have to pass the pipeline. Just nop out any invalid blend state. */
             WARN("Enabling blending on RT %u with format %s, but using integer format is not supported. "
