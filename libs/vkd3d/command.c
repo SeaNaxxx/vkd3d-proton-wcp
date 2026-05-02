@@ -278,7 +278,7 @@ void vkd3d_queue_drain(struct vkd3d_queue *queue, struct d3d12_device *device)
 
         if ((vr = VK_CALL(vkQueueSubmit2(vk_queue, 1, &submit_desc,
             vkd3d_queue_get_signal_fence_proxy_locked(queue)))) < 0)
-            ERR("Failed to submit queue(s), vr %d.\n", vr);
+            WARN("Failed to submit queue(s), vr %d.\n", vr);
     }
 
     if (vr == VK_SUCCESS)
@@ -713,7 +713,7 @@ static void vkd3d_waiting_fence_signal_fence(struct vkd3d_fence_worker *worker,
         TRACE("Signaling fence %p to virtual value %"PRIu64".\n", info->fence, info->virtual_value);
 
         if (FAILED(hr = d3d12_fence_signal(info->fence, worker, info->update_count)))
-            ERR("Failed to signal D3D12 fence, hr %#x.\n", hr);
+            WARN("Failed to signal D3D12 fence, hr %#x.\n", hr);
     }
 
     d3d12_fence_dec_ref(info->fence);
@@ -1135,7 +1135,7 @@ static HRESULT vkd3d_waiting_event_signal(struct d3d12_device *device, struct vk
     hr = vkd3d_native_sync_handle_signal(event->handle);
 
     if (FAILED(hr))
-        ERR("Failed to signal event, hr #%x.\n", hr);
+        WARN("Failed to signal event, hr #%x.\n", hr);
 
     return hr;
 }
@@ -2145,7 +2145,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_shared_fence_Signal(d3d12_fence_iface *if
 
     if ((vr = VK_CALL(vkSignalSemaphore(fence->device->vk_device, &signal_info))))
     {
-        ERR("Failed to signal shared fence, vr %d.\n", vr);
+        WARN("Failed to signal shared fence, vr %d.\n", vr);
         return E_FAIL;
     }
 
@@ -22817,7 +22817,7 @@ static void d3d12_command_queue_flush_waiters(struct d3d12_command_queue *comman
 
         if ((vr = VK_CALL(vkQueueSubmit2(vk_queue, 1, &submit_info,
             vkd3d_queue_get_signal_fence_proxy_locked(command_queue->vkd3d_queue)))))
-            ERR("Failed to submit semaphore waits, vr %d.\n", vr);
+            WARN("Failed to submit semaphore waits, vr %d.\n", vr);
 
         if (vr == VK_SUCCESS && (wait_flags & VKD3D_WAIT_SEMAPHORES_SERIALIZING))
             command_queue->serializing_semaphore_signaled = false;
@@ -23062,7 +23062,7 @@ static void d3d12_command_queue_signal_shared(struct d3d12_command_queue *comman
 
     if (vr < 0)
     {
-        ERR("Failed to submit signal operation, vr %d.\n", vr);
+        WARN("Failed to submit signal operation, vr %d.\n", vr);
         return;
     }
 
@@ -23390,7 +23390,7 @@ static VkResult d3d12_command_queue_submit_split_locked(struct d3d12_device *dev
                 if ((vr = VK_CALL(vkQueueSubmit2(vk_queue, 1, &split_submission,
                         signal_fence && cmd_index + 1 == num_cmds ? vk_fence : VK_NULL_HANDLE))) < 0)
                 {
-                    ERR("Failed to submit queue(s), vr %d.\n", vr);
+                    WARN("Failed to submit queue(s), vr %d.\n", vr);
                     return vr;
                 }
             }
@@ -23398,7 +23398,7 @@ static VkResult d3d12_command_queue_submit_split_locked(struct d3d12_device *dev
         else if ((vr = VK_CALL(vkQueueSubmit2(vk_queue, 1, input_submission,
                 signal_fence ? vk_fence : VK_NULL_HANDLE))) < 0)
         {
-            ERR("Failed to submit queue(s), vr %d.\n", vr);
+            WARN("Failed to submit queue(s), vr %d.\n", vr);
             return vr;
         }
     }
@@ -23747,7 +23747,7 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
         }
         else if ((vr = VK_CALL(vkQueueSubmit2(vk_queue, num_submits, submit_desc, proxy_fence))) < 0)
         {
-            ERR("Failed to submit queue(s), vr %d.\n", vr);
+            WARN("Failed to submit queue(s), vr %d.\n", vr);
         }
 
         if (is_first)
