@@ -1614,6 +1614,10 @@ static HRESULT dxgi_vk_swap_chain_init_sync_objects(struct dxgi_vk_swap_chain *c
             chain->frame_latency_internal = latency_override;
     }
 
+    if (vkd3d_is_adreno(chain->queue->device->device_info.properties2.properties.vendorID) &&
+            chain->frame_latency_internal < 8)
+        chain->frame_latency_internal = 8;
+
     INFO("Ensure maximum latency of %u frames with KHR_present_wait.\n",
             chain->frame_latency_internal);
 
