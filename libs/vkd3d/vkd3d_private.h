@@ -153,6 +153,8 @@ struct vkd3d_vulkan_info
     bool KHR_cooperative_matrix;
     bool KHR_unified_image_layouts;
     bool KHR_present_mode_fifo_latest_ready;
+    bool QCOM_render_pass_shader_resolve;
+    bool has_render_pass_shader_resolve;
     /* EXT device extensions */
     bool EXT_conditional_rendering;
     bool EXT_conservative_rasterization;

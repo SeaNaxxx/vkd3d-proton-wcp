@@ -18,6 +18,7 @@
 
 #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
 
+#include "adreno_quirks.h"
 #include "vkd3d_private.h"
 #include "vkd3d_sonames.h"
 #include "vkd3d_descriptor_debug.h"
@@ -93,6 +94,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(KHR_PRESENT_ID_2, KHR_present_id2),
     VK_EXTENSION(KHR_PRESENT_WAIT_2, KHR_present_wait2),
     VK_EXTENSION(EXT_PRESENT_TIMING, EXT_present_timing),
+    VK_EXTENSION(QCOM_RENDER_PASS_SHADER_RESOLVE, QCOM_render_pass_shader_resolve),
 #ifdef _WIN32
     VK_EXTENSION(KHR_EXTERNAL_MEMORY_WIN32, KHR_external_memory_win32),
     VK_EXTENSION(KHR_EXTERNAL_SEMAPHORE_WIN32, KHR_external_semaphore_win32),
@@ -3706,6 +3708,12 @@ static HRESULT vkd3d_select_queues(const struct d3d12_device *device,
     if (info->family_index[VKD3D_QUEUE_FAMILY_TRANSFER] == VK_QUEUE_FAMILY_IGNORED)
         info->family_index[VKD3D_QUEUE_FAMILY_TRANSFER] = info->family_index[VKD3D_QUEUE_FAMILY_COMPUTE];
 
+    if (vkd3d_is_adreno(device->device_info.properties2.properties.vendorID))
+    {
+        info->family_index[VKD3D_QUEUE_FAMILY_TRANSFER] =
+                info->family_index[VKD3D_QUEUE_FAMILY_COMPUTE];
+    }
+
     info->family_index[VKD3D_QUEUE_FAMILY_INTERNAL_COMPUTE] = info->family_index[VKD3D_QUEUE_FAMILY_COMPUTE];
 
     if (single_queue)
@@ -3840,6 +3848,9 @@ static void d3d12_device_init_workarounds(struct d3d12_device *device)
             break;
     }
 
+    if (vkd3d_is_adreno(device->device_info.properties2.properties.vendorID))
+        device->vk_info.has_render_pass_shader_resolve = device->vk_info.QCOM_render_pass_shader_resolve;
+
     /* For testing purposes, allow us to exercise all code paths on all GPUs. */
     if (vkd3d_debug_control_get_behavior_flags() & VKD3D_DEBUG_CONTROL_BEHAVIOR_ENABLE_TILER_SYNC)
         device->workarounds.tiler_renderpass_barriers = true;
@@ -3854,7 +3865,6 @@ static void d3d12_device_init_workarounds(struct d3d12_device *device)
      * Be spec correct by default, and go a bit out of spec if we know the drivers are sensible. */
     switch (device->device_info.vulkan_1_2_properties.driverID)
     {
-        case VK_DRIVER_ID_MESA_TURNIP:
         case VK_DRIVER_ID_MESA_RADV:
         case VK_DRIVER_ID_MESA_NVK:
         case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
