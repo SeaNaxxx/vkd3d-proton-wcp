@@ -21,6 +21,7 @@
 #ifdef _WIN32
 #include "vkd3d_win32.h"
 #endif
+#include "adreno_quirks.h"
 #include "vkd3d_private.h"
 #include "vkd3d_timestamp_profiler.h"
 
@@ -2248,6 +2249,8 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
     swapchain_create_info.imageFormat = surface_format.format;
     swapchain_create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (vkd3d_is_adreno(chain->queue->device->device_info.properties2.properties.vendorID))
+        swapchain_create_info.imageUsage &= ~VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     swapchain_create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     swapchain_create_info.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     swapchain_create_info.presentMode = chain->present.selected_present_mode;
@@ -2504,6 +2507,8 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
     blit_command = !blank_present &&
             viewport.width == (float)chain->present.backbuffer_width &&
             viewport.height == (float)chain->present.backbuffer_height;
+    if (vkd3d_is_adreno(chain->queue->device->device_info.properties2.properties.vendorID))
+        blit_command = false;
 
     memset(&dep_info, 0, sizeof(dep_info));
     dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
