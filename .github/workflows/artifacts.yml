@@ -1,31 +1,199 @@
-name: Artifacts (Package)
+name: Build Winlator WCP
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  workflow_dispatch:
+    inputs:
+      VERSION:
+        description: Optional vkd3d-proton tag override
+        required: false
+        type: string
+      LLVM_TAG:
+        description: Optional llvm-mingw tag override
+        required: false
+        type: string
+      FORCE_MODE:
+        description: Force rebuild
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -Eeuo pipefail {0}
+
+env:
+  system32: ${system32}
+  syswow64: ${syswow64}
 
 jobs:
-  build-artifacts:
+  build-wcp:
     runs-on: ubuntu-24.04
 
     steps:
     - name: Checkout code
-      id: checkout-code
       uses: actions/checkout@v4
       with:
+        path: src
         submodules: recursive
 
-    - name: Build release
-      id: build-release
-      uses: Joshua-Ashton/arch-mingw-github-action@v8
-      with:
-        command: |
-          export VERSION_NAME="${GITHUB_REF##*/}-${GITHUB_SHA##*/}"
-          ./package-release.sh ${VERSION_NAME} build --no-package
-          echo "VERSION_NAME=${VERSION_NAME}" >> $GITHUB_ENV
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y curl jq glslang-tools mingw-w64-tools python3-pip zstd
+        python3 -m pip install --user meson ninja
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-    - name: Upload artifacts
-      id: upload-artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: vkd3d-proton-${{ env.VERSION_NAME }}
-        path: build/vkd3d-proton-${{ env.VERSION_NAME }}
-        if-no-files-found: error
+    - name: Resolve version inputs
+      env:
+        VERSION_INPUT: ${{ inputs.VERSION }}
+        LLVM_TAG_INPUT: ${{ inputs.LLVM_TAG }}
+      run: |
+        if [[ -n "$VERSION_INPUT" ]]; then
+          VER="$VERSION_INPUT"
+        else
+          VER=$(curl -fsSL "https://api.github.com/repos/HansKristian-Work/vkd3d-proton/tags?per_page=1" | jq -r '.[0].name')
+        fi
+
+        if [[ -n "$LLVM_TAG_INPUT" ]]; then
+          LLVM_TAG="$LLVM_TAG_INPUT"
+          LLVM_RELEASE=$(curl -fsSL "https://api.github.com/repos/mstorsjo/llvm-mingw/releases/tags/${LLVM_TAG}")
+        else
+          LLVM_RELEASE=$(curl -fsSL "https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest")
+          LLVM_TAG=$(jq -r '.tag_name' <<< "$LLVM_RELEASE")
+        fi
+
+        ASSET_URL=$(jq -r 'first(.assets[] | select(.name | test("ucrt.*ubuntu.*x86_64\\.tar\\.xz$")) | .browser_download_url)' <<< "$LLVM_RELEASE")
+        if [[ -z "$ASSET_URL" ]]; then
+          echo "No llvm-mingw Ubuntu x86_64 UCRT archive found for ${LLVM_TAG}" >&2
+          exit 1
+        fi
+
+        COMMIT=$(git -C src rev-parse --short=8 HEAD)
+        PKG="vkd3d-proton-v${VER}-${COMMIT}"
+        echo "VER=$VER" >> "$GITHUB_ENV"
+        echo "LLVM_TAG=$LLVM_TAG" >> "$GITHUB_ENV"
+        echo "LLVM_URL=$ASSET_URL" >> "$GITHUB_ENV"
+        echo "COMMIT=$COMMIT" >> "$GITHUB_ENV"
+        echo "PKG=$PKG" >> "$GITHUB_ENV"
+
+    - name: Check existing release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        FORCE_MODE: ${{ inputs.FORCE_MODE }}
+      run: |
+        if gh release view "$PKG" >/dev/null 2>&1 && [[ "$FORCE_MODE" != "true" ]]; then
+          echo "Release $PKG already exists; skipping."
+          echo "SKIP_RELEASE=true" >> "$GITHUB_ENV"
+        else
+          echo "SKIP_RELEASE=false" >> "$GITHUB_ENV"
+        fi
+
+    - name: Download llvm-mingw
+      if: env.SKIP_RELEASE != 'true'
+      run: |
+        curl -fsSL "$LLVM_URL" -o llvm-mingw.tar.xz
+        mkdir llvm-mingw
+        tar -xf llvm-mingw.tar.xz -C llvm-mingw --strip-components=1
+        echo "$PWD/llvm-mingw/bin" >> "$GITHUB_PATH"
+
+    - name: Configure llvm-mingw cross files
+      if: env.SKIP_RELEASE != 'true'
+      run: |
+        cat > src/llvm-win64.txt << 'EOF'
+        [binaries]
+        c = 'x86_64-w64-mingw32-clang'
+        cpp = 'x86_64-w64-mingw32-clang++'
+        ar = 'llvm-ar'
+        strip = 'llvm-strip'
+        widl-mingw-tools-fallback = 'x86_64-w64-mingw32-widl'
+
+        [properties]
+        needs_exe_wrapper = true
+
+        [host_machine]
+        system = 'windows'
+        cpu_family = 'x86_64'
+        cpu = 'x86_64'
+        endian = 'little'
+        EOF
+
+        cat > src/llvm-win32.txt << 'EOF'
+        [binaries]
+        c = 'i686-w64-mingw32-clang'
+        cpp = 'i686-w64-mingw32-clang++'
+        ar = 'llvm-ar'
+        strip = 'llvm-strip'
+        widl-mingw-tools-fallback = 'i686-w64-mingw32-widl'
+
+        [properties]
+        needs_exe_wrapper = true
+
+        [host_machine]
+        system = 'windows'
+        cpu_family = 'x86'
+        cpu = 'x86'
+        endian = 'little'
+        EOF
+
+    - name: Build x64
+      if: env.SKIP_RELEASE != 'true'
+      run: |
+        meson setup src/build-x64 src --cross-file src/llvm-win64.txt --buildtype release -Db_lto=true -Db_ndebug=true -Dstrip=true
+        ninja -C src/build-x64
+
+    - name: Build x86
+      if: env.SKIP_RELEASE != 'true'
+      run: |
+        meson setup src/build-x86 src --cross-file src/llvm-win32.txt --buildtype release -Db_lto=true -Db_ndebug=true -Dstrip=true
+        ninja -C src/build-x86
+
+    - name: Create Package
+      if: env.SKIP_RELEASE != 'true'
+      run: |
+        mkdir -p pkg/system32 pkg/syswow64
+        for dll in d3d12.dll d3d12core.dll; do
+          SRC=$(find src/build-x64 -name "$dll" -type f | head -1)
+          [[ -n "$SRC" ]] && cp "$SRC" pkg/system32/
+          SRC=$(find src/build-x86 -name "$dll" -type f | head -1)
+          [[ -n "$SRC" ]] && cp "$SRC" pkg/syswow64/
+        done
+
+        cat > pkg/profile.json << JSONEOF
+        {
+          "type": "VKD3D",
+          "versionName": "${VER}-${COMMIT}",
+          "versionCode": 0,
+          "description": "vkd3d-proton",
+          "files": [
+            {"source": "system32/d3d12.dll", "target": "${system32}/d3d12.dll"},
+            {"source": "system32/d3d12core.dll", "target": "${system32}/d3d12core.dll"},
+            {"source": "syswow64/d3d12.dll", "target": "${syswow64}/d3d12.dll"},
+            {"source": "syswow64/d3d12core.dll", "target": "${syswow64}/d3d12core.dll"}
+          ]
+        }
+        JSONEOF
+
+        PKG="vkd3d-proton-v${VER}-${COMMIT}"
+        cd pkg && tar --zstd -cf "../${PKG}.wcp" . && cd ..
+        echo "PKG=$PKG" >> $GITHUB_ENV
+
+    - name: Publish Release
+      if: env.SKIP_RELEASE != 'true'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        FORCE_MODE: ${{ inputs.FORCE_MODE }}
+      run: |
+        if gh release view "$PKG" >/dev/null 2>&1; then
+          if [[ "$FORCE_MODE" != "true" ]]; then
+            echo "Release $PKG already exists; skipping."
+            exit 0
+          fi
+          gh release delete "$PKG" --yes --cleanup-tag
+        fi
+
+        gh release create "$PKG" "${PKG}.wcp" \
+          --title "$PKG" \
+          --notes "vkd3d-proton ${VER} ${COMMIT} built with llvm-mingw ${LLVM_TAG}"
