@@ -4,28 +4,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define VKD3D_VENDOR_QUALCOMM 0x5143u
+/* VKD3D_VENDOR_ID_QUALCOMM is defined in vkd3d_private.h.
+ * Including this header requires vkd3d_private.h to be included first
+ * (which is the case for all current users: device.c, resource.c, swapchain.c). */
 
 static inline bool vkd3d_is_adreno(uint32_t vendor_id)
 {
-    return vendor_id == VKD3D_VENDOR_QUALCOMM;
-}
-
-static inline bool vkd3d_is_adreno_a7xx(uint32_t vendor_id, uint32_t device_id)
-{
-    return vendor_id == VKD3D_VENDOR_QUALCOMM &&
-           device_id >= 0x0700u && device_id < 0x0800u;
-}
-
-static inline bool vkd3d_is_adreno_a8xx(uint32_t vendor_id, uint32_t device_id)
-{
-    return vendor_id == VKD3D_VENDOR_QUALCOMM &&
-           device_id >= 0x0800u && device_id < 0x0900u;
-}
-
-static inline bool vkd3d_is_adreno_tiler(uint32_t vendor_id)
-{
-    return vendor_id == VKD3D_VENDOR_QUALCOMM;
+    
+    return vendor_id == VKD3D_VENDOR_ID_QUALCOMM;
 }
 
 #endif
