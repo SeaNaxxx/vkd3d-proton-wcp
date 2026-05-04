@@ -1,16 +1,7 @@
 name: Artifacts (Package)
-
 on:
   workflow_dispatch:
     inputs:
-      BRANCH:
-        description: Source branch (master = vanilla upstream, adreno-dx12 = patched)
-        required: false
-        default: adreno-dx12
-        type: choice
-        options:
-          - adreno-dx12
-          - master
       VERSION:
         description: Optional vkd3d-proton tag override
         required: false
@@ -24,32 +15,26 @@ on:
         required: false
         default: false
         type: boolean
-
 permissions:
   contents: write
-
 defaults:
   run:
     shell: bash --noprofile --norc -Eeuo pipefail {0}
-
 env:
   system32: ${system32}
   syswow64: ${syswow64}
-
 jobs:
   build-wcp:
     runs-on: ubuntu-24.04
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        ref: ${{ inputs.BRANCH || 'adreno-dx12' }}
+        ref: ${{ github.ref }}
         path: src
         submodules: recursive
         fetch-depth: 0
-
-    - name: Verify branch
+    - name: Verify source
       run: |
         cd src
         ACTUAL_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "detached")
@@ -57,17 +42,22 @@ jobs:
         echo "Branch: $ACTUAL_BRANCH"
         echo "Commit: $ACTUAL_COMMIT"
         if [[ ! -f libs/vkd3d/device.c ]]; then
-          echo "ERROR: vkd3d-proton source layout not found." >&2
+          echo "ERROR: vkd3d-proton source layout not found (libs/vkd3d/device.c missing)." >&2
           exit 1
         fi
-
+        if [[ ! -f meson.build ]]; then
+          echo "ERROR: meson.build missing at root." >&2
+          exit 1
+        fi
+        if [[ ! -d subprojects/Vulkan-Headers ]] && [[ ! -d khronos/Vulkan-Headers ]]; then
+          echo "WARNING: Vulkan-Headers submodule may be missing." >&2
+        fi
     - name: Install build dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y curl jq glslang-tools mingw-w64-tools python3-pip zstd
         python3 -m pip install --user meson ninja
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
     - name: Resolve version inputs
       env:
         VERSION_INPUT: ${{ inputs.VERSION }}
@@ -88,7 +78,6 @@ jobs:
           fi
         fi
         VER="${VER#v}"
-
         if [[ -n "$LLVM_TAG_INPUT" ]]; then
           LLVM_TAG="$LLVM_TAG_INPUT"
           LLVM_RELEASE=$(curl -fsSL "https://api.github.com/repos/mstorsjo/llvm-mingw/releases/tags/${LLVM_TAG}")
@@ -96,19 +85,18 @@ jobs:
           LLVM_RELEASE=$(curl -fsSL "https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest")
           LLVM_TAG=$(jq -r '.tag_name' <<< "$LLVM_RELEASE")
         fi
-
         ASSET_URL=$(jq -r 'first(.assets[] | select(.name | test("ucrt.*ubuntu.*x86_64\\.tar\\.xz$")) | .browser_download_url)' <<< "$LLVM_RELEASE")
         if [[ -z "$ASSET_URL" ]]; then
           echo "No llvm-mingw Ubuntu x86_64 UCRT archive found for ${LLVM_TAG}" >&2
           exit 1
         fi
-
         COMMIT=$(git -C src rev-parse --short=8 HEAD)
-        BRANCH="${{ inputs.BRANCH || 'adreno-dx12' }}"
+        BRANCH=$(git -C src rev-parse --abbrev-ref HEAD 2>/dev/null || echo "detached")
+        SAFE_BRANCH=$(echo "$BRANCH" | tr '/' '-')
         if [[ "$BRANCH" == "master" ]]; then
           PKG="vkd3d-proton-${VER}-${COMMIT}"
         else
-          PKG="vkd3d-proton-${VER}-${COMMIT}-${BRANCH}"
+          PKG="vkd3d-proton-${VER}-${COMMIT}-${SAFE_BRANCH}"
         fi
         echo "VER=$VER" >> "$GITHUB_ENV"
         echo "LLVM_TAG=$LLVM_TAG" >> "$GITHUB_ENV"
@@ -116,7 +104,6 @@ jobs:
         echo "COMMIT=$COMMIT" >> "$GITHUB_ENV"
         echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
         echo "PKG=$PKG" >> "$GITHUB_ENV"
-
     - name: Check existing release
       env:
         GH_TOKEN: ${{ github.token }}
@@ -129,7 +116,6 @@ jobs:
         else
           echo "SKIP_RELEASE=false" >> "$GITHUB_ENV"
         fi
-
     - name: Download llvm-mingw
       if: env.SKIP_RELEASE != 'true'
       run: |
@@ -137,7 +123,6 @@ jobs:
         mkdir llvm-mingw
         tar -xf llvm-mingw.tar.xz -C llvm-mingw --strip-components=1
         echo "$PWD/llvm-mingw/bin" >> "$GITHUB_PATH"
-
     - name: Configure llvm-mingw cross files
       if: env.SKIP_RELEASE != 'true'
       run: |
@@ -148,17 +133,14 @@ jobs:
         ar = 'llvm-ar'
         strip = 'llvm-strip'
         widl-mingw-tools-fallback = 'x86_64-w64-mingw32-widl'
-
         [properties]
         needs_exe_wrapper = true
-
         [host_machine]
         system = 'windows'
         cpu_family = 'x86_64'
         cpu = 'x86_64'
         endian = 'little'
         EOF
-
         cat > src/llvm-win32.txt << 'EOF'
         [binaries]
         c = 'i686-w64-mingw32-clang'
@@ -166,29 +148,24 @@ jobs:
         ar = 'llvm-ar'
         strip = 'llvm-strip'
         widl-mingw-tools-fallback = 'i686-w64-mingw32-widl'
-
         [properties]
         needs_exe_wrapper = true
-
         [host_machine]
         system = 'windows'
         cpu_family = 'x86'
         cpu = 'x86'
         endian = 'little'
         EOF
-
     - name: Build x64
       if: env.SKIP_RELEASE != 'true'
       run: |
         meson setup src/build-x64 src --cross-file src/llvm-win64.txt --buildtype release -Db_lto=true -Db_ndebug=true -Dstrip=true
         ninja -C src/build-x64
-
     - name: Build x86
       if: env.SKIP_RELEASE != 'true'
       run: |
         meson setup src/build-x86 src --cross-file src/llvm-win32.txt --buildtype release -Db_lto=true -Db_ndebug=true -Dstrip=true
         ninja -C src/build-x86
-
     - name: Create Package
       if: env.SKIP_RELEASE != 'true'
       run: |
@@ -199,7 +176,6 @@ jobs:
           SRC=$(find src/build-x86 -name "$dll" -type f | head -1)
           [[ -n "$SRC" ]] && cp "$SRC" pkg/syswow64/
         done
-
         cat > pkg/profile.json << JSONEOF
         {
           "type": "VKD3D",
@@ -214,9 +190,7 @@ jobs:
           ]
         }
         JSONEOF
-
         cd pkg && tar --zstd -cf "../${PKG}.wcp" . && cd ..
-
     - name: Publish Release
       if: env.SKIP_RELEASE != 'true'
       env:
@@ -231,7 +205,7 @@ jobs:
           fi
           gh release delete "$PKG" --yes --cleanup-tag
         fi
-
         gh release create "$PKG" "${PKG}.wcp" \
           --title "$PKG" \
           --notes "vkd3d-proton ${VER} (branch: ${BRANCH}, commit: ${COMMIT}) built with llvm-mingw ${LLVM_TAG}"
+          
