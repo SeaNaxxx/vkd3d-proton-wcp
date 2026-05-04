@@ -1,4 +1,4 @@
-name: Build Winlator WCP (ARM64EC)
+name: Artifacts Arm64ec (Package)
 
 on:
   workflow_dispatch:
