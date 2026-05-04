@@ -21,8 +21,8 @@
 #ifdef _WIN32
 #include "vkd3d_win32.h"
 #endif
-#include "adreno_quirks.h"
 #include "vkd3d_private.h"
+#include "adreno_quirks.h"
 #include "vkd3d_timestamp_profiler.h"
 
 static inline bool vkd3d_swapchain_present_mode_parse(const char *string, VkPresentModeKHR *present_mode)
