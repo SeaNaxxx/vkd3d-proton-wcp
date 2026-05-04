@@ -22,8 +22,8 @@
 #include <float.h>
 #include <math.h>
 
-#include "adreno_quirks.h"
 #include "vkd3d_private.h"
+#include "adreno_quirks.h"
 #include "vkd3d_d3dkmt.h"
 #include "vkd3d_rw_spinlock.h"
 #include "vkd3d_descriptor_debug.h"
