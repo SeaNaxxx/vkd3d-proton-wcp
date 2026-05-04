@@ -18,8 +18,8 @@
 
 #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
 
-#include "adreno_quirks.h"
 #include "vkd3d_private.h"
+#include "adreno_quirks.h"
 #include "vkd3d_sonames.h"
 #include "vkd3d_descriptor_debug.h"
 #include "vkd3d_timestamp_profiler.h"
