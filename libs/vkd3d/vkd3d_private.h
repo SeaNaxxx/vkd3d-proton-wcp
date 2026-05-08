@@ -146,6 +146,7 @@ struct vkd3d_vulkan_info
     bool KHR_maintenance8;
     bool KHR_maintenance9;
     bool KHR_maintenance10;
+    bool KHR_maintenance11;
     bool KHR_shader_maximal_reconvergence;
     bool KHR_shader_quad_control;
     bool KHR_compute_shader_derivatives;
@@ -1262,7 +1263,7 @@ HRESULT vkd3d_allocate_device_memory(struct d3d12_device *device,
 void vkd3d_free_device_memory(struct d3d12_device *device,
         const struct vkd3d_device_memory_allocation *allocation);
 HRESULT vkd3d_allocate_internal_buffer_memory(struct d3d12_device *device, VkBuffer vk_buffer,
-        VkMemoryPropertyFlags type_flags,
+        VkMemoryPropertyFlags type_flags, VkMemoryAllocateFlags allocate_flags,
         struct vkd3d_device_memory_allocation *allocation);
 HRESULT vkd3d_create_buffer(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
@@ -1327,6 +1328,7 @@ struct vkd3d_buffer_view_desc
     const struct vkd3d_format *format;
     VkDeviceSize offset;
     VkDeviceSize size;
+    VkBufferUsageFlags2 usage;
 };
 
 struct vkd3d_texture_view_desc
@@ -1470,7 +1472,7 @@ void d3d12_desc_create_sampler_embedded(vkd3d_cpu_descriptor_va_t sampler,
 
 bool vkd3d_create_vk_buffer_view(struct d3d12_device *device,
         VkBuffer vk_buffer, const struct vkd3d_format *format,
-        VkDeviceSize offset, VkDeviceSize range, VkBufferView *vk_view);
+        VkDeviceSize offset, VkDeviceSize range, VkBufferUsageFlags2 usage, VkBufferView *vk_view);
 bool vkd3d_create_raw_buffer_view(struct d3d12_device *device,
         D3D12_GPU_VIRTUAL_ADDRESS gpu_address, VkBufferView *vk_buffer_view);
 HRESULT d3d12_create_static_sampler(struct d3d12_device *device,
@@ -1585,6 +1587,8 @@ struct d3d12_descriptor_heap
     {
         VkBuffer vk_buffer;
         VkDeviceAddress va;
+        VkDeviceSize size;
+        VkDeviceSize reserved_offset;
         struct vkd3d_device_memory_allocation device_allocation;
         uint8_t *host_allocation;
         VkDeviceSize offsets[VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS];
@@ -1611,6 +1615,13 @@ struct d3d12_descriptor_heap
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
 
+    /* For descriptor heap, command allocator can borrow single descriptors from the heap
+     * which is required in order to execute meta commands. */
+#define VKD3D_DESCRIPTOR_HEAP_META_DESCRIPTOR_COUNT 4096
+    pthread_mutex_t meta_descriptor_lock;
+    uint32_t *meta_descriptor_indices;
+    size_t meta_descriptor_index_count;
+
     /* Here we pack metadata data structures for CBV_SRV_UAV and SAMPLER.
      * For RTV/DSV heaps, we just encode rtv_desc structs inline. */
     DECLSPEC_ALIGN(D3D12_DESC_ALIGNMENT) BYTE descriptors[];
@@ -1622,6 +1633,9 @@ void d3d12_descriptor_heap_cleanup(struct d3d12_descriptor_heap *descriptor_heap
 bool d3d12_descriptor_heap_require_padding_descriptors(struct d3d12_device *device);
 void d3d12_descriptor_heap_inc_ref(struct d3d12_descriptor_heap *heap);
 void d3d12_descriptor_heap_dec_ref(struct d3d12_descriptor_heap *heap);
+
+uint32_t d3d12_descriptor_heap_allocate_meta_index(struct d3d12_descriptor_heap *heap);
+void d3d12_descriptor_heap_free_meta_index(struct d3d12_descriptor_heap *heap, uint32_t index);
 
 static inline struct d3d12_descriptor_heap *impl_from_ID3D12DescriptorHeap(ID3D12DescriptorHeap *iface)
 {
@@ -5132,6 +5146,7 @@ struct vkd3d_physical_device_info
     VkPhysicalDeviceMaintenance9FeaturesKHR maintenance_9_features;
     VkPhysicalDeviceMaintenance10FeaturesKHR maintenance_10_features;
     VkPhysicalDeviceMaintenance10PropertiesKHR maintenance_10_properties;
+    VkPhysicalDeviceMaintenance11FeaturesKHR maintenance_11_features;
     VkPhysicalDeviceLineRasterizationFeaturesEXT line_rasterization_features;
     VkPhysicalDeviceImageCompressionControlFeaturesEXT image_compression_control_features;
     VkPhysicalDeviceFaultFeaturesEXT fault_features;

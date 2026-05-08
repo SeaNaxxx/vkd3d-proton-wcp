@@ -84,6 +84,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(KHR_MAINTENANCE_8, KHR_maintenance8),
     VK_EXTENSION(KHR_MAINTENANCE_9, KHR_maintenance9),
     VK_EXTENSION(KHR_MAINTENANCE_10, KHR_maintenance10),
+    VK_EXTENSION(KHR_MAINTENANCE_11, KHR_maintenance11),
     VK_EXTENSION(KHR_SHADER_MAXIMAL_RECONVERGENCE, KHR_shader_maximal_reconvergence),
     VK_EXTENSION(KHR_SHADER_QUAD_CONTROL, KHR_shader_quad_control),
     VK_EXTENSION(KHR_COMPUTE_SHADER_DERIVATIVES, KHR_compute_shader_derivatives),
@@ -2292,6 +2293,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
         info->maintenance_10_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_10_PROPERTIES_KHR;
         vk_prepend_struct(&info->properties2, &info->maintenance_10_properties);
         vkd3d_physical_device_info_init_maint10(info, device);
+    }
+
+    if (vulkan_info->KHR_maintenance11)
+    {
+        info->maintenance_11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_11_FEATURES_KHR;
+        vk_prepend_struct(&info->features2, &info->maintenance_11_features);
     }
 
     if (vulkan_info->KHR_shader_maximal_reconvergence)
@@ -9320,10 +9327,49 @@ uint32_t d3d12_device_get_max_descriptor_heap_size(struct d3d12_device *device, 
     switch (heap_type)
     {
         case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
-            return VKD3D_MIN_VIEW_DESCRIPTOR_COUNT;
+            /* Only expose very large descriptor heaps if we have ReBAR available.
+             * Otherwise we risk spilling to sysmem. */
+            if (d3d12_device_use_descriptor_heap(device) && device->memory_info.has_gpu_upload_heap)
+            {
+                VkDeviceSize useable_size =
+                    device->device_info.descriptor_heap_properties.maxResourceHeapSize -
+                    device->device_info.descriptor_heap_properties.minResourceHeapReservedRange;
+                uint32_t count;
+
+                /* Reserve at start of heap. */
+                useable_size -= device->bindless_state.heap.redzone_size;
+                /* Dummy NULL descriptor. */
+                useable_size -= device->bindless_state.cbv_srv_uav_size;
+                /* Meta reservation. */
+                useable_size -= VKD3D_DESCRIPTOR_HEAP_META_DESCRIPTOR_COUNT * device->bindless_state.cbv_srv_uav_size;
+
+                /* Don't report ridiculously large numbers here for safety. Limit the number of descriptors. */
+                count = min(16000000, useable_size >> device->bindless_state.cbv_srv_uav_size_log2);
+                assert(count >= VKD3D_MIN_VIEW_DESCRIPTOR_COUNT);
+                return count;
+            }
+            else
+            {
+                return VKD3D_MIN_VIEW_DESCRIPTOR_COUNT;
+            }
 
         case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
-            return VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT;
+            if (d3d12_device_use_descriptor_heap(device) && device->memory_info.has_gpu_upload_heap)
+            {
+                /* Meta shaders need embedded samplers in some cases, so we cannot potentially expose the larger limits. */
+                VkDeviceSize useable_size =
+                    device->device_info.descriptor_heap_properties.maxSamplerHeapSize -
+                    device->device_info.descriptor_heap_properties.minSamplerHeapReservedRangeWithEmbedded;
+
+                /* Don't report ridiculously large numbers here for safety. Limit the number of descriptors. */
+                uint32_t count = min(1000000, useable_size >> device->bindless_state.sampler_size_log2);
+                assert(count >= VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT);
+                return count;
+            }
+            else
+            {
+                return VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT;
+            }
 
         default:
             WARN("Unhandled descriptor heap type %u.\n", heap_type);
