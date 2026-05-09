@@ -151,8 +151,6 @@ jobs:
         ar = 'llvm-ar'
         strip = 'llvm-strip'
         widl-mingw-tools-fallback = 'i686-w64-mingw32-widl'
-        [properties]
-        needs_exe_wrapper = true
         [host_machine]
         system = 'windows'
         cpu_family = 'x86'
