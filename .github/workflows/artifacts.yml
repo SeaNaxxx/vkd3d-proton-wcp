@@ -135,9 +135,9 @@ jobs:
         cpp = 'x86_64-w64-mingw32-clang++'
         ar = 'llvm-ar'
         strip = 'llvm-strip'
-        widl-mingw-tools-fallback = 'x86_64-w64-mingw32-widl'
-        [properties]
-        needs_exe_wrapper = true
+        windres = 'x86_64-w64-mingw32-windres'
+        widl = 'x86_64-w64-mingw32-widl'
+        pkg-config = 'pkg-config'
         [host_machine]
         system = 'windows'
         cpu_family = 'x86_64'
@@ -150,23 +150,25 @@ jobs:
         cpp = 'i686-w64-mingw32-clang++'
         ar = 'llvm-ar'
         strip = 'llvm-strip'
-        widl-mingw-tools-fallback = 'i686-w64-mingw32-widl'
+        windres = 'i686-w64-mingw32-windres'
+        widl = 'i686-w64-mingw32-widl'
+        pkg-config = 'pkg-config'
         [host_machine]
         system = 'windows'
         cpu_family = 'x86'
-        cpu = 'x86'
+        cpu = 'i686'
         endian = 'little'
         EOF
     - name: Build x64
       if: env.SKIP_RELEASE != 'true'
       run: |
-        meson setup src/build-x64 src --cross-file src/llvm-win64.txt --buildtype release -Db_lto=true -Db_ndebug=true -Dstrip=true
-        ninja -C src/build-x64
+        meson setup src/build-x64 src --cross-file src/llvm-win64.txt --buildtype release -Db_ndebug=true -Dstrip=true
+        ninja -C src/build-x64 -j 2
     - name: Build x86
       if: env.SKIP_RELEASE != 'true'
       run: |
-        meson setup src/build-x86 src --cross-file src/llvm-win32.txt --buildtype release -Db_lto=true -Db_ndebug=true -Dstrip=true
-        ninja -C src/build-x86
+        meson setup src/build-x86 src --cross-file src/llvm-win32.txt --buildtype release -Db_ndebug=true -Dstrip=true
+        ninja -C src/build-x86 -j 2
     - name: Create Package
       if: env.SKIP_RELEASE != 'true'
       run: |
@@ -177,11 +179,12 @@ jobs:
           SRC=$(find src/build-x86 -name "$dll" -type f | head -1)
           [[ -n "$SRC" ]] && cp "$SRC" pkg/syswow64/
         done
+        llvm-strip --strip-all pkg/system32/*.dll pkg/syswow64/*.dll
         cat > pkg/profile.json << JSONEOF
         {
           "type": "VKD3D",
           "versionName": "${VER}-${COMMIT}",
-          "versionCode": 0,
+          "versionCode": 1,
           "description": "vkd3d-proton",
           "files": [
             {"source": "system32/d3d12.dll", "target": "${system32}/d3d12.dll"},
@@ -209,4 +212,3 @@ jobs:
         gh release create "$PKG" "${PKG}.wcp" \
           --title "$PKG" \
           --notes "vkd3d-proton ${VER} (branch: ${BRANCH}, commit: ${COMMIT}) built with llvm-mingw ${LLVM_TAG}"
-          
