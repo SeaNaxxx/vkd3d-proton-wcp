@@ -42,6 +42,7 @@
 #include "vkd3d_string.h"
 #include "vkd3d_file_utils.h"
 #include "vkd3d_native_sync_handle.h"
+#include "config_flags.h"
 #include "copy_utils.h"
 #include <assert.h>
 #include <inttypes.h>
@@ -61,7 +62,7 @@
 /* The above plus one push descriptor set + static sampler set + static sampler set for local root signatures. */
 #define VKD3D_MAX_DESCRIPTOR_SETS (VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS + 3u)
 #define VKD3D_MAX_MUTABLE_DESCRIPTOR_TYPES 6u
-#define VKD3D_MAX_DESCRIPTOR_SIZE 256u /* Maximum allowed value in VK_EXT_descriptor_buffer. */
+#define VKD3D_MAX_DESCRIPTOR_SIZE 256u /* Maximum allowed value in VK_EXT_descriptor_buffer/heap. */
 
 #define VKD3D_MIN_VIEW_DESCRIPTOR_COUNT (1000000u)
 #define VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT (2048u)
@@ -154,6 +155,7 @@ struct vkd3d_vulkan_info
     bool KHR_cooperative_matrix;
     bool KHR_unified_image_layouts;
     bool KHR_present_mode_fifo_latest_ready;
+    bool KHR_device_address_commands;
     /* EXT device extensions */
     bool EXT_conditional_rendering;
     bool EXT_conservative_rasterization;
@@ -253,8 +255,6 @@ struct vkd3d_instance
 
     LONG refcount;
 };
-
-extern uint64_t vkd3d_config_flags;
 
 struct vkd3d_queue_timeline_trace_cookie
 {
@@ -476,7 +476,7 @@ static inline bool vkd3d_private_data_object_name_ptr(REFGUID guid,
      * but this avoids an additional, needless allocation
      * and some games may spam SetName.
      */
-    if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_DEBUG_UTILS))
+    if (!VKD3D_CONFIG_FLAG_IS_SET(DEBUG_UTILS))
         return false;
 
     if (IsEqualGUID(guid, &WKPDID_D3DDebugObjectName))
@@ -1098,7 +1098,7 @@ struct vkd3d_view_map
 struct vkd3d_sampler_view_map
 {
     struct vkd3d_view_map map;
-    uint32_t custom_border_color_count;
+    uint32_t legacy_custom_border_color_count;
     uint32_t live_object_count;
 };
 
@@ -1478,6 +1478,17 @@ void d3d12_desc_create_uav_embedded(vkd3d_cpu_descriptor_va_t descriptor, struct
 void d3d12_desc_create_sampler_embedded(vkd3d_cpu_descriptor_va_t sampler,
         struct d3d12_device *device, const D3D12_SAMPLER_DESC2 *desc);
 
+void d3d12_desc_create_cbv_heap(vkd3d_cpu_descriptor_va_t descriptor,
+        struct d3d12_device *device, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc);
+void d3d12_desc_create_srv_heap(vkd3d_cpu_descriptor_va_t descriptor,
+        struct d3d12_device *device, struct d3d12_resource *resource,
+        const D3D12_SHADER_RESOURCE_VIEW_DESC *desc);
+void d3d12_desc_create_uav_heap(vkd3d_cpu_descriptor_va_t descriptor, struct d3d12_device *device,
+        struct d3d12_resource *resource, struct d3d12_resource *counter_resource,
+        const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc);
+void d3d12_desc_create_sampler_heap(vkd3d_cpu_descriptor_va_t sampler,
+        struct d3d12_device *device, const D3D12_SAMPLER_DESC2 *desc);
+
 bool vkd3d_create_vk_buffer_view(struct d3d12_device *device,
         VkBuffer vk_buffer, const struct vkd3d_format *format,
         VkDeviceSize offset, VkDeviceSize range, VkBufferUsageFlags2 usage, VkBufferView *vk_view);
@@ -1485,6 +1496,16 @@ bool vkd3d_create_raw_buffer_view(struct d3d12_device *device,
         D3D12_GPU_VIRTUAL_ADDRESS gpu_address, VkBufferView *vk_buffer_view);
 HRESULT d3d12_create_static_sampler(struct d3d12_device *device,
         const D3D12_STATIC_SAMPLER_DESC1 *desc, VkSampler *vk_sampler);
+
+struct d3d12_root_signature_static_sampler_vk_desc
+{
+    VkSamplerCreateInfo desc;
+    VkSamplerReductionModeCreateInfoEXT reduction;
+};
+
+void d3d12_setup_static_sampler_info(struct d3d12_device *device,
+        const D3D12_STATIC_SAMPLER_DESC1 *desc,
+        struct d3d12_root_signature_static_sampler_vk_desc *vk_desc);
 
 #define D3D12_DESC_ALIGNMENT 32
 struct d3d12_rtv_desc
@@ -1691,6 +1712,24 @@ static inline struct d3d12_desc_split_embedded d3d12_desc_decode_embedded_resour
         /* Shader visible VA. We don't care about metadata at this point. */
         split.metadata = NULL;
         split.payload = (uint8_t *)va;
+    }
+
+    return split;
+}
+
+static inline struct d3d12_desc_split_embedded d3d12_desc_decode_embedded_resource_va_with_metadata(
+        vkd3d_cpu_descriptor_va_t va, uint32_t packed_metadata_offset, void *stack_payload)
+{
+    struct d3d12_desc_split_embedded split = d3d12_desc_decode_embedded_resource_va(va);
+
+    /* Only fish out metadata for host descriptor heap. */
+    if (!split.metadata && (va & VKD3D_RESOURCE_EMBEDDED_METADATA_OFFSET_LOG2_MASK) == VKD3D_RESOURCE_EMBEDDED_CACHED_MASK)
+    {
+        /* If we have a stack payload, it should be written there rather than getting double write on write-combined memory. */
+        if (stack_payload)
+            split.metadata = void_ptr_offset(stack_payload, packed_metadata_offset);
+        else
+            split.metadata = void_ptr_offset(split.payload, packed_metadata_offset);
     }
 
     return split;
@@ -1907,6 +1946,13 @@ struct vkd3d_descriptor_hoist_info
     unsigned int num_desc;
 };
 
+enum vkd3d_root_signature_heap_redzone_style
+{
+    VKD3D_ROOT_SIGNATURE_HEAP_REDZONE_STYLE_NONE = 0,
+    VKD3D_ROOT_SIGNATURE_HEAP_REDZONE_STYLE_INLINE,
+    VKD3D_ROOT_SIGNATURE_HEAP_REDZONE_STYLE_DESCRIPTOR
+};
+
 struct d3d12_root_signature
 {
     ID3D12RootSignature ID3D12RootSignature_iface;
@@ -1966,6 +2012,19 @@ struct d3d12_root_signature
     unsigned int static_sampler_count;
     D3D12_STATIC_SAMPLER_DESC1 *static_samplers_desc;
     VkSampler *static_samplers;
+
+    struct
+    {
+        VkShaderDescriptorSetAndBindingMappingInfoEXT mapping_info;
+        VkDescriptorSetAndBindingMappingEXT *mappings;
+        size_t mappings_size;
+        size_t mappings_count;
+
+        struct d3d12_root_signature_static_sampler_vk_desc *vk_static_samplers_desc;
+        enum vkd3d_root_signature_heap_redzone_style redzone_style;
+        /* Ideal: Push descriptor heap VA + descriptor heap size straight into PushData. */
+        uint32_t redzone_inline_heap_offset;
+    } heap;
 
     struct vkd3d_descriptor_hoist_info hoist_info;
 
@@ -3860,6 +3919,13 @@ static inline struct d3d12_command_signature *impl_from_ID3D12CommandSignature(I
     return CONTAINING_RECORD(iface, struct d3d12_command_signature, ID3D12CommandSignature_iface);
 }
 
+struct vkd3d_sampler_custom_border_color
+{
+    VkBorderColor border_color;
+    VkClearColorValue color;
+    uint32_t index;
+};
+
 /* Static samplers */
 struct vkd3d_sampler_state
 {
@@ -3869,7 +3935,18 @@ struct vkd3d_sampler_state
     VkDescriptorPool *vk_descriptor_pools;
     size_t vk_descriptor_pools_size;
     size_t vk_descriptor_pool_count;
+
+    struct vkd3d_sampler_custom_border_color *border_colors;
+    size_t border_color_bank_size;
+    size_t border_color_count;
+    bool noop_registration;
+    uint32_t noop_registration_index;
 };
+
+uint32_t vkd3d_sampler_state_register_custom_border_color(
+        struct d3d12_device *device,
+        struct vkd3d_sampler_state *state, VkBorderColor border_color,
+        const VkSamplerCustomBorderColorCreateInfoEXT *info);
 
 struct vkd3d_shader_debug_ring
 {
@@ -4099,7 +4176,7 @@ uint32_t vkd3d_breadcrumb_tracer_shader_hash_forces_barrier(
         struct vkd3d_breadcrumb_tracer *device, vkd3d_shader_hash_t hash);
 
 #define VKD3D_BREADCRUMB_FLUSH_BATCHES(list) do { \
-    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) { \
+    if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS)) { \
         d3d12_command_list_end_transfer_batch(list);          \
     } \
 } while(0)
@@ -4113,7 +4190,7 @@ void vkd3d_breadcrumb_tracer_register_placed_resource(struct d3d12_heap *heap, s
 void vkd3d_breadcrumb_tracer_unregister_placed_resource(struct d3d12_heap *heap, struct d3d12_resource *resource);
 
 #define VKD3D_BREADCRUMB_COMMAND(cmd_type) do { \
-    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) { \
+    if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS)) { \
         struct vkd3d_breadcrumb_command breadcrumb_cmd; \
         breadcrumb_cmd.type = VKD3D_BREADCRUMB_COMMAND_##cmd_type; \
         vkd3d_breadcrumb_tracer_add_command(list, &breadcrumb_cmd); \
@@ -4123,7 +4200,7 @@ void vkd3d_breadcrumb_tracer_unregister_placed_resource(struct d3d12_heap *heap,
 
 /* State commands do no work on their own, should not signal. */
 #define VKD3D_BREADCRUMB_COMMAND_STATE(cmd_type) do { \
-    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) { \
+    if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS)) { \
         struct vkd3d_breadcrumb_command breadcrumb_cmd; \
         breadcrumb_cmd.type = VKD3D_BREADCRUMB_COMMAND_##cmd_type; \
         vkd3d_breadcrumb_tracer_add_command(list, &breadcrumb_cmd); \
@@ -4131,7 +4208,7 @@ void vkd3d_breadcrumb_tracer_unregister_placed_resource(struct d3d12_heap *heap,
 } while(0)
 
 #define VKD3D_BREADCRUMB_AUX32(v) do { \
-    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) { \
+    if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS)) { \
         struct vkd3d_breadcrumb_command breadcrumb_cmd; \
         breadcrumb_cmd.type = VKD3D_BREADCRUMB_COMMAND_AUX32; \
         breadcrumb_cmd.word_32bit = v; \
@@ -4140,7 +4217,7 @@ void vkd3d_breadcrumb_tracer_unregister_placed_resource(struct d3d12_heap *heap,
 } while(0)
 
 #define VKD3D_BREADCRUMB_AUX64(v) do { \
-    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) { \
+    if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS)) { \
         struct vkd3d_breadcrumb_command breadcrumb_cmd; \
         breadcrumb_cmd.type = VKD3D_BREADCRUMB_COMMAND_AUX64; \
         breadcrumb_cmd.word_64bit = v; \
@@ -4149,7 +4226,7 @@ void vkd3d_breadcrumb_tracer_unregister_placed_resource(struct d3d12_heap *heap,
 } while(0)
 
 #define VKD3D_BREADCRUMB_COOKIE(v) do { \
-    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) { \
+    if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS)) { \
         struct vkd3d_breadcrumb_command breadcrumb_cmd; \
         breadcrumb_cmd.type = VKD3D_BREADCRUMB_COMMAND_COOKIE; \
         breadcrumb_cmd.word_64bit = v; \
@@ -4158,7 +4235,7 @@ void vkd3d_breadcrumb_tracer_unregister_placed_resource(struct d3d12_heap *heap,
 } while(0)
 
 #define VKD3D_BREADCRUMB_TAG(tag_static_str) do { \
-    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) { \
+    if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS)) { \
         struct vkd3d_breadcrumb_command breadcrumb_cmd; \
         breadcrumb_cmd.type = VKD3D_BREADCRUMB_COMMAND_TAG; \
         breadcrumb_cmd.tag = tag_static_str; \
@@ -4170,7 +4247,7 @@ void vkd3d_breadcrumb_tracer_unregister_placed_resource(struct d3d12_heap *heap,
 #define VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, cond) do { \
     if (cond) \
         d3d12_device_report_fault(device); \
-    if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) && (cond)) { \
+    if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS) && (cond)) { \
         vkd3d_breadcrumb_tracer_report_device_lost(&(device)->breadcrumb_tracer, device); \
         vkd3d_shader_debug_ring_kick(&(device)->debug_ring, device, true); \
     } \
@@ -5181,6 +5258,7 @@ struct vkd3d_physical_device_info
     VkPhysicalDevicePresentTimingFeaturesEXT present_timing_features;
     VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV ray_tracing_invocation_reorder_features_nv;
     VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptor_heap_features;
+    VkPhysicalDeviceDeviceAddressCommandsFeaturesKHR device_address_commands_features;
 
     VkPhysicalDeviceFeatures2 features2;
 
