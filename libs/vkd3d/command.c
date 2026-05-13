@@ -2513,7 +2513,7 @@ static void d3d12_command_list_begin_new_sequence(struct d3d12_command_list *lis
 
     d3d12_command_list_invalidate_all_state(list);
     /* Extra special consideration since we're starting a fresh command buffer. */
-    list->descriptor_heap.buffers.heap_dirty = true;
+    list->descriptor_heap.buffers.global_heap_dirty = true;
     d3d12_command_list_debug_mark_label(list, "Split", 0.0f, 0.0f, 0.0f, 1.0f);
 }
 
@@ -5231,6 +5231,47 @@ static size_t get_query_heap_stride(D3D12_QUERY_HEAP_TYPE heap_type)
     return sizeof(uint64_t);
 }
 
+void d3d12_command_list_meta_push_data(struct d3d12_command_list *list,
+        VkCommandBuffer vk_command_buffer,
+        VkPipelineLayout vk_pipeline_layout, VkShaderStageFlags stages,
+        uint32_t size, const void *data)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+
+    if (vk_pipeline_layout != VK_NULL_HANDLE)
+    {
+        VK_CALL(vkCmdPushConstants(vk_command_buffer,
+                vk_pipeline_layout,
+                stages, 0, size, data));
+
+        if (d3d12_device_use_descriptor_heap(list->device) && list->cmd.vk_command_buffer == vk_command_buffer)
+            d3d12_command_list_invalidate_descriptor_heap(list);
+    }
+    else
+    {
+        VkPushDataInfoEXT push;
+        memset(&push, 0, sizeof(push));
+        push.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT;
+        push.data.address = data;
+        push.data.size = size;
+        VK_CALL(vkCmdPushDataEXT(vk_command_buffer, &push));
+    }
+
+    if (list->cmd.vk_command_buffer == vk_command_buffer)
+    {
+        if (stages & VK_SHADER_STAGE_COMPUTE_BIT)
+        {
+            d3d12_command_list_invalidate_root_parameters(list,
+                &list->compute_bindings, true, &list->graphics_bindings);
+        }
+        else
+        {
+            d3d12_command_list_invalidate_root_parameters(list,
+                &list->graphics_bindings, true, &list->compute_bindings);
+        }
+    }
+}
+
 static bool d3d12_command_list_gather_pending_queries(struct d3d12_command_list *list)
 {
     /* TODO allocate arrays from command allocator in case
@@ -5502,9 +5543,9 @@ static bool d3d12_command_list_gather_pending_queries(struct d3d12_command_list 
 
         entry_offset += d->virtual_query_count;
 
-        VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer,
+        d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
                 gather_pipeline.vk_pipeline_layout,
-                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), &args));
+                VK_SHADER_STAGE_COMPUTE_BIT, sizeof(args), &args);
 
         workgroup_count = vkd3d_compute_workgroup_count(d->unique_query_count, VKD3D_QUERY_OP_WORKGROUP_SIZE);
         VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer, workgroup_count, 1, 1));
@@ -5521,7 +5562,6 @@ static bool d3d12_command_list_gather_pending_queries(struct d3d12_command_list 
     result = true;
 
     d3d12_command_list_invalidate_current_pipeline(list, true);
-    d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, &list->graphics_bindings);
 
     VKD3D_BREADCRUMB_COMMAND(GATHER_VIRTUAL_QUERY);
 
@@ -6234,7 +6274,7 @@ static void d3d12_command_list_invalidate_push_constants(struct vkd3d_pipeline_b
 }
 
 void d3d12_command_list_invalidate_root_parameters(struct d3d12_command_list *list,
-        struct vkd3d_pipeline_bindings *bindings, bool invalidate_descriptor_heaps,
+        struct vkd3d_pipeline_bindings *bindings, bool invalidate_legacy_descriptor_sets,
         struct vkd3d_pipeline_bindings *sibling_push_domain)
 {
     /* For scenarios where we're emitting push constants to one bind point in meta shaders,
@@ -6256,11 +6296,18 @@ void d3d12_command_list_invalidate_root_parameters(struct d3d12_command_list *li
 
     d3d12_command_list_invalidate_push_constants(bindings);
 
-    if (invalidate_descriptor_heaps)
+    /* This is relevant if the pipeline layout changes, but it's irrelevant for EXT_descriptor_heap. */
+    if (invalidate_legacy_descriptor_sets)
     {
         struct d3d12_device *device = bindings->root_signature->device;
-        bindings->descriptor_heap_dirty_mask = (1ull << device->bindless_state.legacy.set_count) - 1;
+        bindings->legacy_descriptor_set_dirty_mask = (1ull << device->bindless_state.legacy.set_count) - 1;
     }
+}
+
+void d3d12_command_list_invalidate_descriptor_heap(struct d3d12_command_list *list)
+{
+    list->descriptor_heap.buffers.global_heap_dirty = true;
+    WARN("Invalidating descriptor heap due to meta command which is incompatible with heaps.\n");
 }
 
 static void vk_access_and_stage_flags_from_d3d12_resource_state(const struct d3d12_command_list *list,
@@ -7100,12 +7147,19 @@ bool d3d12_command_list_reset_query(struct d3d12_command_list *list,
 
 static void d3d12_command_list_init_default_descriptor_buffers(struct d3d12_command_list *list)
 {
-    if (d3d12_device_uses_descriptor_buffers(list->device))
+    if (d3d12_device_use_descriptor_heap(list->device))
     {
-        list->descriptor_heap.buffers.heap_va_resource = list->device->global_descriptor_buffer.resource.va;
-        list->descriptor_heap.buffers.heap_va_sampler = list->device->global_descriptor_buffer.sampler.va;
-        list->descriptor_heap.buffers.vk_buffer_resource = list->device->global_descriptor_buffer.resource.vk_buffer;
-        list->descriptor_heap.buffers.heap_dirty = true;
+        /* By default, don't bind descriptor heap unless it's actually needed.
+         * Drivers are able to inherit across command buffer boundary if they have a design
+         * that cares about it. */
+        list->descriptor_heap.buffers.global_heap_dirty = false;
+    }
+    else if (d3d12_device_uses_descriptor_buffers(list->device))
+    {
+        list->descriptor_heap.buffers.db.heap_va_resource = list->device->global_descriptor_buffer.resource.va;
+        list->descriptor_heap.buffers.db.heap_va_sampler = list->device->global_descriptor_buffer.sampler.va;
+        list->descriptor_heap.buffers.db.vk_buffer_resource = list->device->global_descriptor_buffer.resource.vk_buffer;
+        list->descriptor_heap.buffers.global_heap_dirty = true;
     }
 }
 
@@ -7700,7 +7754,17 @@ static void d3d12_command_list_update_descriptor_table_offsets(struct d3d12_comm
     }
 
     /* Set descriptor offsets */
-    if (push_stages)
+    if (d3d12_device_use_descriptor_heap(list->device))
+    {
+        VkPushDataInfoEXT info;
+        memset(&info, 0, sizeof(info));
+        info.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT;
+        info.offset = root_signature->descriptor_table_offset;
+        info.data.address = table_offsets;
+        info.data.size = root_signature->descriptor_table_count * sizeof(uint32_t);
+        VK_CALL(vkCmdPushDataEXT(list->cmd.vk_command_buffer, &info));
+    }
+    else if (push_stages)
     {
         VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer,
                 layout, push_stages,
@@ -7750,37 +7814,69 @@ static void vk_write_descriptor_set_from_scratch_push_ubo(VkWriteDescriptorSet *
 }
 
 /* This is a big stall on some GPUs so need to track this separately. */
-void d3d12_command_list_update_descriptor_buffers(struct d3d12_command_list *list)
+void d3d12_command_list_update_global_descriptor_heap(struct d3d12_command_list *list)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
     VkDescriptorBufferBindingPushDescriptorBufferHandleEXT buffer_handle;
     VkDescriptorBufferBindingInfoEXT global_buffers[2];
+    VkBindHeapInfoEXT resource_heap_info;
 
-    if (d3d12_device_uses_descriptor_buffers(list->device) &&
-            list->descriptor_heap.buffers.heap_dirty)
+    /* global_heap_dirty is part of a union and only okay to touch if we use DB or heaps. */
+
+    if (d3d12_device_use_descriptor_heap(list->device) &&
+            list->descriptor_heap.buffers.global_heap_dirty)
+    {
+        memset(&resource_heap_info, 0, sizeof(resource_heap_info));
+        resource_heap_info.sType = VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT;
+
+        /* Do not bind dummy heap. */
+        if (list->descriptor_heap.buffers.resource.va)
+        {
+            resource_heap_info.heapRange.address = list->descriptor_heap.buffers.resource.va;
+            resource_heap_info.heapRange.size = list->descriptor_heap.buffers.resource.size;
+            resource_heap_info.reservedRangeOffset = list->descriptor_heap.buffers.resource.reserved_offset;
+            resource_heap_info.reservedRangeSize =
+                    list->device->device_info.descriptor_heap_properties.minResourceHeapReservedRange;
+            VK_CALL(vkCmdBindResourceHeapEXT(list->cmd.vk_command_buffer, &resource_heap_info));
+        }
+
+        if (list->descriptor_heap.buffers.sampler.va)
+        {
+            resource_heap_info.heapRange.address = list->descriptor_heap.buffers.sampler.va;
+            resource_heap_info.heapRange.size = list->descriptor_heap.buffers.sampler.size;
+            resource_heap_info.reservedRangeOffset = list->descriptor_heap.buffers.sampler.reserved_offset;
+            resource_heap_info.reservedRangeSize =
+                    list->device->device_info.descriptor_heap_properties.minSamplerHeapReservedRangeWithEmbedded;
+            VK_CALL(vkCmdBindSamplerHeapEXT(list->cmd.vk_command_buffer, &resource_heap_info));
+        }
+
+        list->descriptor_heap.buffers.global_heap_dirty = false;
+    }
+    else if (d3d12_device_uses_descriptor_buffers(list->device) &&
+            list->descriptor_heap.buffers.global_heap_dirty)
     {
         global_buffers[0].sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT;
         global_buffers[0].pNext = NULL;
         global_buffers[0].usage = list->device->global_descriptor_buffer.resource.usage;
-        global_buffers[0].address = list->descriptor_heap.buffers.heap_va_resource;
+        global_buffers[0].address = list->descriptor_heap.buffers.db.heap_va_resource;
 
         if (global_buffers[0].usage & VK_BUFFER_USAGE_PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER_BIT_EXT)
         {
             global_buffers[0].pNext = &buffer_handle;
             buffer_handle.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_PUSH_DESCRIPTOR_BUFFER_HANDLE_EXT;
             buffer_handle.pNext = NULL;
-            buffer_handle.buffer = list->descriptor_heap.buffers.vk_buffer_resource;
+            buffer_handle.buffer = list->descriptor_heap.buffers.db.vk_buffer_resource;
         }
 
         global_buffers[1].sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT;
         global_buffers[1].pNext = NULL;
         global_buffers[1].usage = list->device->global_descriptor_buffer.sampler.usage;
-        global_buffers[1].address = list->descriptor_heap.buffers.heap_va_sampler;
+        global_buffers[1].address = list->descriptor_heap.buffers.db.heap_va_sampler;
 
         VK_CALL(vkCmdBindDescriptorBuffersEXT(list->cmd.vk_command_buffer,
                 ARRAY_SIZE(global_buffers), global_buffers));
 
-        list->descriptor_heap.buffers.heap_dirty = false;
+        list->descriptor_heap.buffers.global_heap_dirty = false;
     }
 }
 
@@ -7791,28 +7887,35 @@ static void d3d12_command_list_update_descriptor_heaps(struct d3d12_command_list
     const struct vkd3d_bindless_state *bindless_state = &list->device->bindless_state;
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
 
-    if (!bindings->descriptor_heap_dirty_mask)
+    if (d3d12_device_use_descriptor_heap(list->device))
+    {
+        /* We don't bind legacy sets. */
+        d3d12_command_list_update_global_descriptor_heap(list);
+        return;
+    }
+
+    if (!bindings->legacy_descriptor_set_dirty_mask)
         return;
 
     if (d3d12_device_uses_descriptor_buffers(list->device))
     {
-        d3d12_command_list_update_descriptor_buffers(list);
+        d3d12_command_list_update_global_descriptor_heap(list);
 
         /* Prefer binding everything in one go. There is no risk of null descriptor sets here. */
-        if (bindings->descriptor_heap_dirty_mask)
+        if (bindings->legacy_descriptor_set_dirty_mask)
         {
             VK_CALL(vkCmdSetDescriptorBufferOffsetsEXT(list->cmd.vk_command_buffer, vk_bind_point,
                     layout, 0, bindless_state->legacy.set_count,
                     bindless_state->legacy.vk_descriptor_buffer_indices,
-                    list->descriptor_heap.buffers.vk_offsets));
-            bindings->descriptor_heap_dirty_mask = 0;
+                    list->descriptor_heap.buffers.db.vk_offsets));
+            bindings->legacy_descriptor_set_dirty_mask = 0;
         }
     }
     else
     {
-        while (bindings->descriptor_heap_dirty_mask)
+        while (bindings->legacy_descriptor_set_dirty_mask)
         {
-            unsigned int heap_index = vkd3d_bitmask_iter64(&bindings->descriptor_heap_dirty_mask);
+            unsigned int heap_index = vkd3d_bitmask_iter64(&bindings->legacy_descriptor_set_dirty_mask);
 
             if (list->descriptor_heap.sets.vk_sets[heap_index])
             {
@@ -7862,16 +7965,34 @@ static void d3d12_command_list_update_root_constants(struct d3d12_command_list *
         return;
     }
 
-    while (bindings->root_constant_dirty_mask)
+    if (d3d12_device_use_descriptor_heap(list->device))
     {
-        root_parameter_index = vkd3d_bitmask_iter64(&bindings->root_constant_dirty_mask);
-        root_constant = root_signature_get_32bit_constants(root_signature, root_parameter_index);
+        VkPushDataInfoEXT info;
+        memset(&info, 0, sizeof(info));
+        info.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT;
 
-        VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer,
-                layout, push_stages,
-                root_constant->constant_index * sizeof(uint32_t),
-                root_constant->constant_count * sizeof(uint32_t),
-                &bindings->root_constants[root_constant->constant_index]));
+        while (bindings->root_constant_dirty_mask)
+        {
+            root_parameter_index = vkd3d_bitmask_iter64(&bindings->root_constant_dirty_mask);
+            root_constant = root_signature_get_32bit_constants(root_signature, root_parameter_index);
+            info.data.address = &bindings->root_constants[root_constant->constant_index];
+            info.offset = root_constant->constant_index * sizeof(uint32_t);
+            info.data.size = root_constant->constant_count * sizeof(uint32_t);
+            VK_CALL(vkCmdPushDataEXT(list->cmd.vk_command_buffer, &info));
+        }
+    }
+    else
+    {
+        while (bindings->root_constant_dirty_mask)
+        {
+            root_parameter_index = vkd3d_bitmask_iter64(&bindings->root_constant_dirty_mask);
+            root_constant = root_signature_get_32bit_constants(root_signature, root_parameter_index);
+            VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer,
+                    layout, push_stages,
+                    root_constant->constant_index * sizeof(uint32_t),
+                    root_constant->constant_count * sizeof(uint32_t),
+                    &bindings->root_constants[root_constant->constant_index]));
+        }
     }
 }
 
@@ -8011,12 +8132,24 @@ static void d3d12_command_list_update_root_descriptors(struct d3d12_command_list
 
         descriptor_write_count += 1;
     }
-    else if (va_count && push_stages)
+    else if (va_count)
     {
-        VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer,
-                layout, push_stages,
-                0, va_count * sizeof(*root_parameter_data.root_descriptor_vas),
-                root_parameter_data.root_descriptor_vas));
+        if (d3d12_device_use_descriptor_heap(list->device))
+        {
+            VkPushDataInfoEXT info;
+            memset(&info, 0, sizeof(info));
+            info.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT;
+            info.data.address = root_parameter_data.root_descriptor_vas;
+            info.data.size = va_count * sizeof(*root_parameter_data.root_descriptor_vas);
+            VK_CALL(vkCmdPushDataEXT(list->cmd.vk_command_buffer, &info));
+        }
+        else if (push_stages)
+        {
+            VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer,
+                    layout, push_stages,
+                    0, va_count * sizeof(*root_parameter_data.root_descriptor_vas),
+                    root_parameter_data.root_descriptor_vas));
+        }
     }
 
 #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
@@ -8122,8 +8255,7 @@ static void d3d12_command_list_update_descriptors(struct d3d12_command_list *lis
 
     vk_bind_point = vk_bind_point_from_pipeline_type(list->active_pipeline_type);
 
-    if (bindings->descriptor_heap_dirty_mask)
-        d3d12_command_list_update_descriptor_heaps(list, bindings, vk_bind_point, layout);
+    d3d12_command_list_update_descriptor_heaps(list, bindings, vk_bind_point, layout);
 
     if (bindings->dirty_flags & VKD3D_PIPELINE_DIRTY_STATIC_SAMPLER_SET)
         d3d12_command_list_update_static_samplers(list, bindings, vk_bind_point, layout);
@@ -8810,7 +8942,6 @@ static bool d3d12_command_list_emit_multi_dispatch_indirect_count(struct d3d12_c
     if (vk_patch_cmd_buffer == list->cmd.vk_command_buffer)
     {
         d3d12_command_list_invalidate_current_pipeline(list, true);
-        d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, &list->graphics_bindings);
     }
     else
     {
@@ -8826,9 +8957,9 @@ static bool d3d12_command_list_emit_multi_dispatch_indirect_count(struct d3d12_c
 
     VK_CALL(vkCmdBindPipeline(vk_patch_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline_info.vk_pipeline));
-    VK_CALL(vkCmdPushConstants(vk_patch_cmd_buffer,
+    d3d12_command_list_meta_push_data(list, vk_patch_cmd_buffer,
             pipeline_info.vk_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(args), &args));
+            sizeof(args), &args);
 
     VK_CALL(vkCmdDispatch(vk_patch_cmd_buffer,
             vkd3d_compute_workgroup_count(max_commands, vkd3d_meta_get_multi_dispatch_indirect_workgroup_size()),
@@ -8886,9 +9017,9 @@ static bool d3d12_command_list_emit_predicated_command(struct d3d12_command_list
 
     VK_CALL(vkCmdBindPipeline(vk_patch_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline_info.vk_pipeline));
-    VK_CALL(vkCmdPushConstants(vk_patch_cmd_buffer,
+    d3d12_command_list_meta_push_data(list, vk_patch_cmd_buffer,
             pipeline_info.vk_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(args), &args));
+            sizeof(args), &args);
     VK_CALL(vkCmdDispatch(vk_patch_cmd_buffer, 1, 1, 1));
 
     if (vk_patch_cmd_buffer == list->cmd.vk_command_buffer)
@@ -8908,7 +9039,6 @@ static bool d3d12_command_list_emit_predicated_command(struct d3d12_command_list
         VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
 
         d3d12_command_list_invalidate_current_pipeline(list, true);
-        d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, &list->graphics_bindings);
     }
     else
         list->cmd.indirect_meta->need_compute_to_indirect_barrier = true;
@@ -9808,8 +9938,7 @@ static void d3d12_command_list_copy_image(struct d3d12_command_list *list,
         }
 
         d3d12_command_list_invalidate_current_pipeline(list, true);
-        d3d12_command_list_invalidate_root_parameters(list, &list->graphics_bindings, true, &list->compute_bindings);
-        d3d12_command_list_update_descriptor_buffers(list);
+        d3d12_command_list_update_global_descriptor_heap(list);
 
         memset(&dst_view_desc, 0, sizeof(dst_view_desc));
         dst_view_desc.image = dst_resource->res.vk_image;
@@ -9924,15 +10053,17 @@ static void d3d12_command_list_copy_image(struct d3d12_command_list *list,
             {
                 push_args.bit_mask = 1u << i;
                 VK_CALL(vkCmdSetStencilWriteMask(list->cmd.vk_command_buffer, VK_STENCIL_FACE_FRONT_AND_BACK, push_args.bit_mask));
-                VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, pipeline_info.vk_pipeline_layout,
-                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push_args), &push_args));
+                d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
+                        pipeline_info.vk_pipeline_layout,
+                        VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(push_args), &push_args);
                 VK_CALL(vkCmdDraw(list->cmd.vk_command_buffer, 3, region->dstSubresource.layerCount, 0, 0));
             }
         }
         else
         {
-            VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, pipeline_info.vk_pipeline_layout,
-                    VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push_args), &push_args));
+            d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
+                    pipeline_info.vk_pipeline_layout,
+                    VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(push_args), &push_args);
             VK_CALL(vkCmdDraw(list->cmd.vk_command_buffer, 3, region->dstSubresource.layerCount, 0, 0));
         }
 
@@ -11591,8 +11722,7 @@ static void d3d12_command_list_execute_resolve(struct d3d12_command_list *list,
     else if (path == VKD3D_RESOLVE_IMAGE_PATH_COMPUTE_PIPELINE)
     {
         d3d12_command_list_invalidate_current_pipeline(list, true);
-        d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, &list->graphics_bindings);
-        d3d12_command_list_update_descriptor_buffers(list);
+        d3d12_command_list_update_global_descriptor_heap(list);
 
         vk_format = d3d12_command_list_get_resolve_format(list, dst_resource, src_resource, format);
 
@@ -11686,8 +11816,9 @@ static void d3d12_command_list_execute_resolve(struct d3d12_command_list *list,
             compute_args.extent.width = region->extent.width;
             compute_args.extent.height = region->extent.height;
 
-            VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, resolve_pipeline_info.vk_pipeline_layout,
-                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(compute_args), &compute_args));
+            d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
+                    resolve_pipeline_info.vk_pipeline_layout,
+                    VK_SHADER_STAGE_COMPUTE_BIT, sizeof(compute_args), &compute_args);
 
             VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer,
                     vkd3d_compute_workgroup_count(region->extent.width, 8),
@@ -11704,8 +11835,7 @@ cleanup_compute:
     else
     {
         d3d12_command_list_invalidate_current_pipeline(list, true);
-        d3d12_command_list_invalidate_root_parameters(list, &list->graphics_bindings, true, &list->compute_bindings);
-        d3d12_command_list_update_descriptor_buffers(list);
+        d3d12_command_list_update_global_descriptor_heap(list);
 
         vk_format = d3d12_command_list_get_resolve_format(list, dst_resource, src_resource, format);
 
@@ -11867,15 +11997,17 @@ cleanup_compute:
                     {
                         resolve_args.bit_mask = 1u << j;
                         VK_CALL(vkCmdSetStencilWriteMask(list->cmd.vk_command_buffer, VK_STENCIL_FACE_FRONT_AND_BACK, resolve_args.bit_mask));
-                        VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, resolve_pipeline_info.vk_pipeline_layout,
-                                VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(resolve_args), &resolve_args));
+                        d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
+                                resolve_pipeline_info.vk_pipeline_layout,
+                                VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(resolve_args), &resolve_args);
                         VK_CALL(vkCmdDraw(list->cmd.vk_command_buffer, 3, region->dstSubresource.layerCount, 0, 0));
                     }
                 }
                 else
                 {
-                    VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, resolve_pipeline_info.vk_pipeline_layout,
-                            VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(resolve_args), &resolve_args));
+                    d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
+                            resolve_pipeline_info.vk_pipeline_layout,
+                            VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(resolve_args), &resolve_args);
                     VK_CALL(vkCmdDraw(list->cmd.vk_command_buffer, 3, region->dstSubresource.layerCount, 0, 0));
                 }
             }
@@ -13445,8 +13577,56 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteBundle(d3d12_command_lis
 
 static void vkd3d_pipeline_bindings_set_dirty_sets(struct vkd3d_pipeline_bindings *bindings, uint64_t dirty_mask)
 {
-    bindings->descriptor_heap_dirty_mask = dirty_mask;
+    bindings->legacy_descriptor_set_dirty_mask = dirty_mask;
     bindings->dirty_flags |= VKD3D_PIPELINE_DIRTY_HOISTED_DESCRIPTORS;
+}
+
+static void d3d12_command_list_set_descriptor_heaps(struct d3d12_command_list *list,
+        unsigned int heap_count, ID3D12DescriptorHeap *const *heaps)
+{
+    VkDeviceAddress current_resource_va, current_sampler_va;
+    unsigned int i;
+
+    current_resource_va = list->descriptor_heap.buffers.resource.va;
+    current_sampler_va = list->descriptor_heap.buffers.sampler.va;
+
+    list->descriptor_heap.buffers.resource.heap = NULL;
+    list->descriptor_heap.buffers.sampler.heap = NULL;
+
+    for (i = 0; i < heap_count; i++)
+    {
+        struct d3d12_descriptor_heap *heap = impl_from_ID3D12DescriptorHeap(heaps[i]);
+
+        if (!heap)
+            continue;
+
+        if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        {
+            list->descriptor_heap.buffers.resource.va = heap->descriptor_buffer.va;
+            list->descriptor_heap.buffers.resource.size = heap->descriptor_buffer.size;
+            list->descriptor_heap.buffers.resource.reserved_offset = heap->descriptor_buffer.reserved_offset;
+            list->descriptor_heap.buffers.resource.heap = heap;
+
+            /* We might need to push new redzone inline data for example. */
+            d3d12_command_list_invalidate_root_parameters(list, &list->graphics_bindings, false, NULL);
+            d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, false, NULL);
+        }
+        else if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+        {
+            list->descriptor_heap.buffers.sampler.va = heap->descriptor_buffer.va;
+            list->descriptor_heap.buffers.sampler.size = heap->descriptor_buffer.size;
+            list->descriptor_heap.buffers.sampler.reserved_offset = heap->descriptor_buffer.reserved_offset;
+            list->descriptor_heap.buffers.sampler.heap = heap;
+        }
+    }
+
+    if (current_resource_va == list->descriptor_heap.buffers.resource.va &&
+            current_sampler_va == list->descriptor_heap.buffers.sampler.va)
+        return;
+
+    /* Immediately bind the heap. This allows e.g. metacommands to more aggressively use the heap as intended. */
+    list->descriptor_heap.buffers.global_heap_dirty = true;
+    d3d12_command_list_update_global_descriptor_heap(list);
 }
 
 static void d3d12_command_list_set_descriptor_heaps_buffers(struct d3d12_command_list *list,
@@ -13457,8 +13637,8 @@ static void d3d12_command_list_set_descriptor_heaps_buffers(struct d3d12_command
     struct d3d12_desc_split d;
     unsigned int i, j;
 
-    current_resource_va = list->descriptor_heap.buffers.heap_va_resource;
-    current_sampler_va = list->descriptor_heap.buffers.heap_va_sampler;
+    current_resource_va = list->descriptor_heap.buffers.db.heap_va_resource;
+    current_sampler_va = list->descriptor_heap.buffers.db.heap_va_sampler;
 
     for (i = 0; i < heap_count; i++)
     {
@@ -13470,8 +13650,8 @@ static void d3d12_command_list_set_descriptor_heaps_buffers(struct d3d12_command
 
         if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
         {
-            list->descriptor_heap.buffers.heap_va_resource = heap->descriptor_buffer.va;
-            list->descriptor_heap.buffers.vk_buffer_resource = heap->descriptor_buffer.vk_buffer;
+            list->descriptor_heap.buffers.db.heap_va_resource = heap->descriptor_buffer.va;
+            list->descriptor_heap.buffers.db.vk_buffer_resource = heap->descriptor_buffer.vk_buffer;
 
             if (!d3d12_device_use_embedded_mutable_descriptors(list->device))
             {
@@ -13482,19 +13662,19 @@ static void d3d12_command_list_set_descriptor_heaps_buffers(struct d3d12_command
         }
         else if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
         {
-            list->descriptor_heap.buffers.heap_va_sampler = heap->descriptor_buffer.va;
+            list->descriptor_heap.buffers.db.heap_va_sampler = heap->descriptor_buffer.va;
         }
 
         for (j = 0; j < bindless_state->legacy.set_count; j++)
             if (bindless_state->legacy.set_info[j].heap_type == heap->desc.Type)
-                list->descriptor_heap.buffers.vk_offsets[j] = heap->descriptor_buffer.offsets[set_index++];
+                list->descriptor_heap.buffers.db.vk_offsets[j] = heap->descriptor_buffer.offsets[set_index++];
     }
 
-    if (current_resource_va == list->descriptor_heap.buffers.heap_va_resource &&
-            current_sampler_va == list->descriptor_heap.buffers.heap_va_sampler)
+    if (current_resource_va == list->descriptor_heap.buffers.db.heap_va_resource &&
+            current_sampler_va == list->descriptor_heap.buffers.db.heap_va_sampler)
         return;
 
-    list->descriptor_heap.buffers.heap_dirty = true;
+    list->descriptor_heap.buffers.global_heap_dirty = true;
     /* Invalidation is a bit more aggressive for descriptor buffers.
      * We also need to invalidate any push descriptors. */
     d3d12_command_list_invalidate_root_parameters(list, &list->graphics_bindings, true, NULL);
@@ -13560,7 +13740,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetDescriptorHeaps(d3d12_comman
         }
     }
 
-    if (d3d12_device_uses_descriptor_buffers(list->device))
+    if (d3d12_device_use_descriptor_heap(list->device))
+        d3d12_command_list_set_descriptor_heaps(list, heap_count, heaps);
+    else if (d3d12_device_uses_descriptor_buffers(list->device))
         d3d12_command_list_set_descriptor_heaps_buffers(list, heap_count, heaps);
     else
         d3d12_command_list_set_descriptor_heaps_sets(list, heap_count, heaps);
@@ -14876,8 +15058,7 @@ static void d3d12_command_list_clear_uav(struct d3d12_command_list *list,
     d3d12_command_list_debug_mark_begin_region(list, "ClearUAV");
 
     d3d12_command_list_invalidate_current_pipeline(list, true);
-    d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, &list->graphics_bindings);
-    d3d12_command_list_update_descriptor_buffers(list);
+    d3d12_command_list_update_global_descriptor_heap(list);
 
     sampler_feedback_clear = d3d12_resource_desc_is_sampler_feedback(&resource->desc);
 
@@ -15020,9 +15201,9 @@ static void d3d12_command_list_clear_uav(struct d3d12_command_list *list,
             clear_args.extent.width = curr_rect.right - clear_args.offset.x;
             clear_args.extent.height = curr_rect.bottom - clear_args.offset.y;
 
-            VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer,
+            d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
                     pipeline.vk_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                    0, sizeof(clear_args), &clear_args));
+                    sizeof(clear_args), &clear_args);
 
             VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer,
                     min(workgroup_count.width - j, max_workgroup_count),
@@ -15071,8 +15252,7 @@ static void d3d12_command_list_clear_uav_with_copy(struct d3d12_command_list *li
     d3d12_command_list_debug_mark_begin_region(list, "ClearUAVWithCopy");
 
     d3d12_command_list_invalidate_current_pipeline(list, true);
-    d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, &list->graphics_bindings);
-    d3d12_command_list_update_descriptor_buffers(list);
+    d3d12_command_list_update_global_descriptor_heap(list);
 
     assert(!args->view && !args->use_heap);
     assert(d3d12_resource_is_texture(resource));
@@ -15152,9 +15332,9 @@ static void d3d12_command_list_clear_uav_with_copy(struct d3d12_command_list *li
     clear_args.extent.width = element_count;
     clear_args.extent.height = 1;
 
-    VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer,
+    d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
             pipeline.vk_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(clear_args), &clear_args));
+            sizeof(clear_args), &clear_args);
 
     VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer,
             vkd3d_compute_workgroup_count(element_count, workgroup_size.width), 1, 1));
@@ -16148,7 +16328,6 @@ static void d3d12_command_list_resolve_binary_occlusion_queries(struct d3d12_com
     VkDependencyInfo dep_info;
 
     d3d12_command_list_invalidate_current_pipeline(list, true);
-    d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, &list->graphics_bindings);
 
     memset(&dep_info, 0, sizeof(dep_info));
     dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -16178,9 +16357,9 @@ static void d3d12_command_list_resolve_binary_occlusion_queries(struct d3d12_com
     args.src_va = src_va;
     args.query_count = count;
 
-    VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer,
+    d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
             query_ops->vk_resolve_pipeline_layout,
-            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), &args));
+            VK_SHADER_STAGE_COMPUTE_BIT, sizeof(args), &args);
 
     workgroup_count = vkd3d_compute_workgroup_count(count, VKD3D_QUERY_OP_WORKGROUP_SIZE);
     VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer, workgroup_count, 1, 1));
@@ -16310,8 +16489,6 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetPredication(d3d12_command_li
             /* If we cannot hoist the predication work. */
             d3d12_command_list_end_current_render_pass(list, true);
             d3d12_command_list_invalidate_current_pipeline(list, true);
-            d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true,
-                    &list->graphics_bindings);
         }
 
         resolve_args.src_va = resource->res.va + aligned_buffer_offset;
@@ -16320,8 +16497,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetPredication(d3d12_command_li
 
         VK_CALL(vkCmdBindPipeline(vk_patch_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                 predicate_ops->vk_resolve_pipeline));
-        VK_CALL(vkCmdPushConstants(vk_patch_cmd_buffer, predicate_ops->vk_resolve_pipeline_layout,
-                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(resolve_args), &resolve_args));
+        d3d12_command_list_meta_push_data(list, vk_patch_cmd_buffer,
+                predicate_ops->vk_resolve_pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT, sizeof(resolve_args), &resolve_args);
         VK_CALL(vkCmdDispatch(vk_patch_cmd_buffer, 1, 1, 1));
 
         memset(&vk_barrier, 0, sizeof(vk_barrier));
@@ -16870,8 +17048,9 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
         else
             list->cmd.indirect_meta->need_compute_to_indirect_barrier = true;
 
-        VK_CALL(vkCmdPushConstants(vk_patch_cmd_buffer, signature->state_template.dgc.pipeline.vk_pipeline_layout,
-                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(patch_args), &patch_args));
+        d3d12_command_list_meta_push_data(list, vk_patch_cmd_buffer,
+                signature->state_template.dgc.pipeline.vk_pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT, sizeof(patch_args), &patch_args);
         VK_CALL(vkCmdBindPipeline(vk_patch_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                 signature->state_template.dgc.pipeline.vk_pipeline));
 
@@ -17560,8 +17739,7 @@ static void d3d12_command_list_encode_sampler_feedback(struct d3d12_command_list
         return;
 
     d3d12_command_list_invalidate_current_pipeline(list, true);
-    d3d12_command_list_update_descriptor_buffers(list);
-    d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, &list->graphics_bindings);
+    d3d12_command_list_update_global_descriptor_heap(list);
     d3d12_command_list_debug_mark_begin_region(list, "SamplerFeedbackEncode");
 
     /* Fixup subresource indices. */
@@ -17663,8 +17841,9 @@ static void d3d12_command_list_encode_sampler_feedback(struct d3d12_command_list
                 pipeline_info.vk_pipeline));
         VK_CALL(vkCmdPushDescriptorSetKHR(list->cmd.vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                 pipeline_info.vk_layout, 0, ARRAY_SIZE(vk_descriptor_writes), vk_descriptor_writes));
-        VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, pipeline_info.vk_layout,
-                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), &args));
+        d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
+                pipeline_info.vk_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT, sizeof(args), &args);
 
         extent.width = vkd3d_compute_workgroup_count(extent.width,
                 vkd3d_meta_get_sampler_feedback_workgroup_size().width);
@@ -17821,8 +18000,9 @@ static void d3d12_command_list_encode_sampler_feedback(struct d3d12_command_list
                     pipeline_info.vk_pipeline));
             VK_CALL(vkCmdPushDescriptorSetKHR(list->cmd.vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                     pipeline_info.vk_layout, 0, ARRAY_SIZE(vk_descriptor_writes), vk_descriptor_writes));
-            VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, pipeline_info.vk_layout,
-                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), &args));
+            d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
+                    pipeline_info.vk_layout,
+                    VK_SHADER_STAGE_COMPUTE_BIT, sizeof(args), &args);
 
             extent.width = vkd3d_compute_workgroup_count(args.resolve_width,
                     vkd3d_meta_get_sampler_feedback_workgroup_size().width);
@@ -17908,12 +18088,8 @@ static void d3d12_command_list_decode_sampler_feedback(struct d3d12_command_list
         return;
 
     d3d12_command_list_invalidate_current_pipeline(list, true);
-    d3d12_command_list_update_descriptor_buffers(list);
+    d3d12_command_list_update_global_descriptor_heap(list);
     d3d12_command_list_debug_mark_begin_region(list, "SamplerFeedbackDecode");
-    if (dst->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-        d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, &list->graphics_bindings);
-    else
-        d3d12_command_list_invalidate_root_parameters(list, &list->graphics_bindings, true, &list->compute_bindings);
 
     /* Fixup subresource indices. */
     if (src->desc.Format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE)
@@ -18039,8 +18215,9 @@ static void d3d12_command_list_decode_sampler_feedback(struct d3d12_command_list
                 pipeline_info.vk_pipeline));
         VK_CALL(vkCmdPushDescriptorSetKHR(list->cmd.vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                 pipeline_info.vk_layout, 0, ARRAY_SIZE(vk_descriptor_writes), vk_descriptor_writes));
-        VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, pipeline_info.vk_layout,
-                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), &args));
+        d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
+                pipeline_info.vk_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT, sizeof(args), &args);
 
         extent.width = vkd3d_compute_workgroup_count(extent.width,
                 vkd3d_meta_get_sampler_feedback_workgroup_size().width);
@@ -18248,8 +18425,9 @@ static void d3d12_command_list_decode_sampler_feedback(struct d3d12_command_list
             VK_CALL(vkCmdSetScissor(list->cmd.vk_command_buffer, 0, 1, &rendering_info.renderArea));
             VK_CALL(vkCmdPushDescriptorSetKHR(list->cmd.vk_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                     pipeline_info.vk_layout, 0, 1, vk_descriptor_writes));
-            VK_CALL(vkCmdPushConstants(list->cmd.vk_command_buffer, pipeline_info.vk_layout,
-                    VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(args), &args));
+            d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
+                    pipeline_info.vk_layout,
+                    VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(args), &args);
             VK_CALL(vkCmdDraw(list->cmd.vk_command_buffer, 3, dst_image_view_desc.layer_count, 0, 0));
             VK_CALL(vkCmdEndRendering(list->cmd.vk_command_buffer));
 
@@ -25174,6 +25352,7 @@ static HRESULT d3d12_command_signature_init_state_template_dgc(struct d3d12_comm
     struct vkd3d_patch_command *patch_commands = NULL;
     VkIndirectCommandsLayoutTokenEXT *tokens = NULL;
     VkIndirectCommandsIndexBufferTokenEXT ib_token;
+    VkIndirectCommandsTokenTypeEXT push_data_token;
     uint32_t required_stride_alignment = 0;
     VkIndirectCommandsLayoutTokenEXT token;
     uint32_t generic_u32_copy_count;
@@ -25239,6 +25418,9 @@ static HRESULT d3d12_command_signature_init_state_template_dgc(struct d3d12_comm
     };
 
     bind_point_layout = d3d12_root_signature_get_layout(root_signature, signature->pipeline_type);
+    push_data_token = d3d12_device_use_descriptor_heap(device) ?
+            VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_DATA_EXT :
+            VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_CONSTANT_EXT;
 
     for (i = 0; i < desc->NumArgumentDescs; i++)
     {
@@ -25276,7 +25458,7 @@ static HRESULT d3d12_command_signature_init_state_template_dgc(struct d3d12_comm
 
                 if (argument_desc->Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT)
                 {
-                    token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_CONSTANT_EXT;
+                    token.type = push_data_token;
 
                     required_alignment = sizeof(uint32_t);
                     stream_stride = align(stream_stride, required_alignment);
@@ -25288,7 +25470,10 @@ static HRESULT d3d12_command_signature_init_state_template_dgc(struct d3d12_comm
                 }
                 else
                 {
-                    token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_SEQUENCE_INDEX_EXT;
+                    token.type = d3d12_device_use_descriptor_heap(device) ?
+                        VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_DATA_SEQUENCE_INDEX_EXT :
+                        VK_INDIRECT_COMMANDS_TOKEN_TYPE_SEQUENCE_INDEX_EXT;
+
                     token.offset = 0; /* ignored */
                     pc_token->updateRange.size = sizeof(uint32_t);
 
@@ -25319,7 +25504,7 @@ static HRESULT d3d12_command_signature_init_state_template_dgc(struct d3d12_comm
                     goto end;
                 }
 
-                token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_CONSTANT_EXT;
+                token.type = push_data_token;
                 assert(pc_token_count < ARRAY_SIZE(pc_tokens));
                 pc_token = &pc_tokens[pc_token_count++];
                 token.data.pPushConstant = pc_token;

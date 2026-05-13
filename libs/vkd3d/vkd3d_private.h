@@ -2801,7 +2801,7 @@ struct vkd3d_pipeline_bindings
     uint32_t dirty_flags; /* vkd3d_pipeline_dirty_flags */
 
     uint32_t descriptor_tables[D3D12_MAX_ROOT_COST];
-    uint64_t descriptor_heap_dirty_mask;
+    uint64_t legacy_descriptor_set_dirty_mask;
 
     /* Needed when VK_KHR_push_descriptor is not available. */
     struct vkd3d_root_descriptor_info root_descriptors[D3D12_MAX_ROOT_COST];
@@ -3101,12 +3101,23 @@ union vkd3d_descriptor_heap_state
 {
     struct
     {
-        VkDeviceAddress heap_va_resource;
-        VkDeviceAddress heap_va_sampler;
-        VkBuffer vk_buffer_resource;
-        bool heap_dirty;
+        struct
+        {
+            VkDeviceAddress heap_va_resource;
+            VkDeviceAddress heap_va_sampler;
+            VkBuffer vk_buffer_resource;
+            VkDeviceSize vk_offsets[VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS];
+        } db;
 
-        VkDeviceSize vk_offsets[VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS];
+        struct
+        {
+            struct d3d12_descriptor_heap *heap;
+            VkDeviceAddress va;
+            VkDeviceSize size;
+            VkDeviceSize reserved_offset;
+        } resource, sampler;
+
+        bool global_heap_dirty;
     } buffers;
 
     struct
@@ -3451,10 +3462,15 @@ void d3d12_command_list_debug_mark_end_region(struct d3d12_command_list *list);
 
 void d3d12_command_list_invalidate_current_pipeline(struct d3d12_command_list *list, bool meta_shader);
 void d3d12_command_list_invalidate_root_parameters(struct d3d12_command_list *list,
-        struct vkd3d_pipeline_bindings *bindings, bool invalidate_descriptor_heaps,
+        struct vkd3d_pipeline_bindings *bindings, bool invalidate_legacy_descriptor_sets,
         struct vkd3d_pipeline_bindings *sibling_push_domain);
-void d3d12_command_list_update_descriptor_buffers(struct d3d12_command_list *list);
+void d3d12_command_list_invalidate_descriptor_heap(struct d3d12_command_list *list);
+void d3d12_command_list_update_global_descriptor_heap(struct d3d12_command_list *list);
 void d3d12_command_list_flush_dgc_batch(struct d3d12_command_list *list);
+void d3d12_command_list_meta_push_data(struct d3d12_command_list *list,
+        VkCommandBuffer vk_command_buffer,
+        VkPipelineLayout vk_pipeline_layout, VkShaderStageFlags stages,
+        uint32_t size, const void *data);
 
 union vkd3d_root_parameter_data
 {
