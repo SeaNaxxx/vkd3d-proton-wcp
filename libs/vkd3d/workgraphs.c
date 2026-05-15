@@ -1184,7 +1184,7 @@ static HRESULT d3d12_wg_state_object_allocate_ring(struct d3d12_wg_state_object_
     }
 
     if (FAILED(hr = vkd3d_allocate_internal_buffer_memory(device, ring->vk_buffer,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
             &ring->allocation)))
     {
         return hr;
@@ -2185,7 +2185,7 @@ static HRESULT d3d12_wg_state_object_convert_entry_point(
     compile_args.nv_shader_extn_uav_slot = nv_shader_extn.uav_slot;
     compile_args.nv_shader_extn_uav_space = nv_shader_extn.uav_space;
 
-    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_DRIVER_VERSION_SENSITIVE_SHADERS)
+    if (VKD3D_CONFIG_FLAG_IS_SET(DRIVER_VERSION_SENSITIVE_SHADERS))
     {
         compile_args.driver_id = object->device->device_info.vulkan_1_2_properties.driverID;
         compile_args.driver_version = object->device->device_info.properties2.properties.driverVersion;
@@ -2587,13 +2587,13 @@ static void d3d12_command_list_workgraph_bind_resources(struct d3d12_command_lis
     if (d3d12_device_uses_descriptor_buffers(list->device))
     {
         VK_CALL(vkCmdSetDescriptorBufferOffsetsEXT(list->cmd.vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                module->vk_pipeline_layout, 0, bindless_state->set_count,
-                bindless_state->vk_descriptor_buffer_indices,
-                list->descriptor_heap.buffers.vk_offsets));
+                module->vk_pipeline_layout, 0, bindless_state->legacy.set_count,
+                bindless_state->legacy.vk_descriptor_buffer_indices,
+                list->descriptor_heap.buffers.db.vk_offsets));
     }
     else
     {
-        for (i = 0; i < bindless_state->set_count; i++)
+        for (i = 0; i < bindless_state->legacy.set_count; i++)
         {
             if (list->descriptor_heap.sets.vk_sets[i])
             {
@@ -3451,7 +3451,7 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
 
     d3d12_command_list_invalidate_current_pipeline(list, true);
     d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, &list->graphics_bindings);
-    d3d12_command_list_update_descriptor_buffers(list);
+    d3d12_command_list_update_global_descriptor_heap(list);
 
     d3d12_command_list_workgraph_barrier(list,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
