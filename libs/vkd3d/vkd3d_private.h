@@ -156,6 +156,7 @@ struct vkd3d_vulkan_info
     bool KHR_unified_image_layouts;
     bool KHR_present_mode_fifo_latest_ready;
     bool KHR_device_address_commands;
+    bool KHR_opacity_micromap;
     /* EXT device extensions */
     bool EXT_conditional_rendering;
     bool EXT_conservative_rasterization;
@@ -2709,6 +2710,12 @@ struct d3d12_command_allocator_command_pool
     struct d3d12_command_allocator_command_pool_list recycled, pending;
 };
 
+struct vkd3d_descriptor_heap_meta_allocation
+{
+    struct d3d12_descriptor_heap *heap;
+    uint32_t index;
+};
+
 /* ID3D12CommandAllocator */
 struct d3d12_command_allocator
 {
@@ -2744,6 +2751,10 @@ struct d3d12_command_allocator
     size_t query_pools_size;
     size_t query_pool_count;
 
+    struct vkd3d_descriptor_heap_meta_allocation *meta_allocs;
+    size_t meta_allocs_size;
+    size_t meta_allocs_count;
+
     struct vkd3d_query_pool active_query_pools[VKD3D_VIRTUAL_QUERY_TYPE_COUNT];
 
     struct d3d12_command_list *current_command_list;
@@ -2766,6 +2777,8 @@ HRESULT d3d12_command_allocator_create(struct d3d12_device *device,
 bool d3d12_command_allocator_allocate_query_from_type_index(
         struct d3d12_command_allocator *allocator,
         uint32_t type_index, VkQueryPool *query_pool, uint32_t *query_index);
+uint32_t d3d12_command_allocator_allocate_meta_index(
+        struct d3d12_command_allocator *allocator, struct d3d12_descriptor_heap *heap);
 
 struct d3d12_command_list *d3d12_command_list_from_iface(ID3D12CommandList *iface);
 void d3d12_command_list_decay_tracked_state(struct d3d12_command_list *list);
@@ -3475,6 +3488,10 @@ void d3d12_command_list_meta_push_data(struct d3d12_command_list *list,
         VkCommandBuffer vk_command_buffer,
         VkPipelineLayout vk_pipeline_layout, VkShaderStageFlags stages,
         uint32_t size, const void *data);
+void d3d12_command_list_meta_push_descriptor_index(struct d3d12_command_list *list,
+        VkCommandBuffer vk_command_buffer, uint32_t binding, uint32_t heap_index);
+
+#define VKD3D_DESCRIPTOR_HEAP_META_PUSH_DATA_OFFSET 64
 
 union vkd3d_root_parameter_data
 {
@@ -5074,16 +5091,20 @@ struct vkd3d_meta_ops
 {
     struct d3d12_device *device;
     struct vkd3d_meta_ops_common common;
-    struct vkd3d_clear_uav_ops clear_uav;
-    struct vkd3d_copy_image_ops copy_image;
-    struct vkd3d_resolve_image_ops resolve_image;
+    struct vkd3d_clear_uav_ops clear_uav_heap;
+    struct vkd3d_clear_uav_ops clear_uav_legacy;
+    struct vkd3d_copy_image_ops copy_image_heap;
+    struct vkd3d_copy_image_ops copy_image_legacy;
+    struct vkd3d_resolve_image_ops resolve_image_heap;
+    struct vkd3d_resolve_image_ops resolve_image_legacy;
     struct vkd3d_swapchain_ops swapchain;
     struct vkd3d_query_ops query;
     struct vkd3d_predicate_ops predicate;
     struct vkd3d_execute_indirect_ops execute_indirect;
     struct vkd3d_multi_dispatch_indirect_ops multi_dispatch_indirect;
     struct vkd3d_dstorage_ops dstorage;
-    struct vkd3d_sampler_feedback_resolve_ops sampler_feedback;
+    struct vkd3d_sampler_feedback_resolve_ops sampler_feedback_heap;
+    struct vkd3d_sampler_feedback_resolve_ops sampler_feedback_legacy;
     struct vkd3d_workgraph_indirect_ops workgraph;
 };
 
@@ -5091,9 +5112,9 @@ HRESULT vkd3d_meta_ops_init(struct vkd3d_meta_ops *meta_ops, struct d3d12_device
 HRESULT vkd3d_meta_ops_cleanup(struct vkd3d_meta_ops *meta_ops, struct d3d12_device *device);
 
 struct vkd3d_clear_uav_pipeline vkd3d_meta_get_clear_buffer_uav_pipeline(struct vkd3d_meta_ops *meta_ops,
-        bool as_uint, bool raw);
+        bool as_uint, bool raw, bool heap);
 struct vkd3d_clear_uav_pipeline vkd3d_meta_get_clear_image_uav_pipeline(struct vkd3d_meta_ops *meta_ops,
-        VkImageViewType image_view_type, bool as_uint);
+        VkImageViewType image_view_type, bool as_uint, bool heap);
 VkExtent3D vkd3d_meta_get_clear_image_uav_workgroup_size(VkImageViewType view_type);
 
 static inline VkExtent3D vkd3d_meta_get_clear_buffer_uav_workgroup_size()
@@ -5103,13 +5124,13 @@ static inline VkExtent3D vkd3d_meta_get_clear_buffer_uav_workgroup_size()
 }
 
 HRESULT vkd3d_meta_get_copy_image_pipeline(struct vkd3d_meta_ops *meta_ops,
-        const struct vkd3d_copy_image_pipeline_key *key, struct vkd3d_copy_image_info *info);
+        const struct vkd3d_copy_image_pipeline_key *key, struct vkd3d_copy_image_info *info, bool heap);
 VkImageViewType vkd3d_meta_get_copy_image_view_type(D3D12_RESOURCE_DIMENSION dim);
 const struct vkd3d_format *vkd3d_meta_get_copy_image_attachment_format(struct vkd3d_meta_ops *meta_ops,
         const struct vkd3d_format *dst_format, const struct vkd3d_format *src_format,
         VkImageAspectFlags dst_aspect, VkImageAspectFlags src_aspect);
 HRESULT vkd3d_meta_get_resolve_image_pipeline(struct vkd3d_meta_ops *meta_ops,
-        const struct vkd3d_resolve_image_pipeline_key *key, struct vkd3d_resolve_image_info *info);
+        const struct vkd3d_resolve_image_pipeline_key *key, struct vkd3d_resolve_image_info *info, bool heap);
 HRESULT vkd3d_meta_get_swapchain_pipeline(struct vkd3d_meta_ops *meta_ops,
         const struct vkd3d_swapchain_pipeline_key *key, struct vkd3d_swapchain_info *info);
 
@@ -5131,7 +5152,7 @@ HRESULT vkd3d_meta_get_execute_indirect_pipeline(struct vkd3d_meta_ops *meta_ops
         uint32_t patch_command_count, struct vkd3d_execute_indirect_info *info);
 
 void vkd3d_meta_get_sampler_feedback_resolve_pipeline(struct vkd3d_meta_ops *meta_ops,
-        enum vkd3d_sampler_feedback_resolve_type type, struct vkd3d_sampler_feedback_resolve_info *info);
+        enum vkd3d_sampler_feedback_resolve_type type, struct vkd3d_sampler_feedback_resolve_info *info, bool heap);
 
 static inline VkExtent3D vkd3d_meta_get_sampler_feedback_workgroup_size(void)
 {
@@ -5266,7 +5287,8 @@ struct vkd3d_physical_device_info
     VkPhysicalDeviceOpticalFlowFeaturesNV optical_flow_nv_features;
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperative_matrix_features;
     VkPhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT zero_initialize_device_memory_features;
-    VkPhysicalDeviceOpacityMicromapFeaturesEXT opacity_micromap_features;
+    VkPhysicalDeviceOpacityMicromapFeaturesEXT opacity_micromap_features_ext;
+    VkPhysicalDeviceOpacityMicromapFeaturesKHR opacity_micromap_features_khr;
     VkPhysicalDeviceShaderFloat8FeaturesEXT shader_float8_features;
     VkPhysicalDeviceCooperativeMatrix2FeaturesNV cooperative_matrix2_features_nv;
     VkPhysicalDeviceAntiLagFeaturesAMD anti_lag_amd;
@@ -5281,6 +5303,10 @@ struct vkd3d_physical_device_info
     VkPhysicalDeviceDeviceAddressCommandsFeaturesKHR device_address_commands_features;
 
     VkPhysicalDeviceFeatures2 features2;
+
+    /* Logical OR of the KHR and EXT opacity-micromap support flags. */
+    bool supports_opacity_micromap;
+    bool using_khr_opacity_micromap; /* Discriminator KHR / EXT being used. */
 
     /* others, for extensions that have no feature bits */
     uint32_t time_domains;  /* vkd3d_time_domain_flag */
@@ -6854,11 +6880,6 @@ void vkd3d_opacity_micromap_write_postbuild_info(
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc,
         VkDeviceSize desc_offset,
         VkMicromapEXT vk_opacity_micromap);
-void vkd3d_opacity_micromap_emit_postbuild_info(
-        struct d3d12_command_list *list,
-        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc,
-        uint32_t count,
-        const D3D12_GPU_VIRTUAL_ADDRESS *addresses);
 void vkd3d_opacity_micromap_emit_immediate_postbuild_info(
         struct d3d12_command_list *list, uint32_t count,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc,
