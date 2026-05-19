@@ -5946,12 +5946,12 @@ static inline ULONG d3d12_device_release(struct d3d12_device *device)
     return refcount;
 }
 
-static inline bool d3d12_device_use_descriptor_heap(struct d3d12_device *device)
+static inline bool d3d12_device_use_descriptor_heap(const struct d3d12_device *device)
 {
     return (device->bindless_state.flags & VKD3D_BINDLESS_HEAP) != 0;
 }
 
-static inline bool d3d12_device_use_embedded_mutable_descriptors(struct d3d12_device *device)
+static inline bool d3d12_device_use_embedded_mutable_descriptors(const struct d3d12_device *device)
 {
     return (device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED) != 0;
 }
@@ -6306,6 +6306,15 @@ HRESULT d3d12_rt_state_object_create(struct d3d12_device *device, const D3D12_ST
 HRESULT d3d12_rt_state_object_add(struct d3d12_device *device, const D3D12_STATE_OBJECT_DESC *desc,
         struct d3d12_rt_state_object *parent,
         struct d3d12_rt_state_object **object);
+
+struct vkd3d_fused_root_signature_mappings
+{
+    VkShaderDescriptorSetAndBindingMappingInfoEXT mapping_info;
+    VkDescriptorSetAndBindingMappingEXT mappings[];
+};
+
+struct vkd3d_fused_root_signature_mappings *d3d12_state_object_fuse_root_signature_mappings(
+        struct d3d12_root_signature *global, struct d3d12_root_signature *local);
 
 static inline struct d3d12_rt_state_object *rt_impl_from_ID3D12StateObject(ID3D12StateObject *iface)
 {
