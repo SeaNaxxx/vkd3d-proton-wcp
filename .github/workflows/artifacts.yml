@@ -173,12 +173,12 @@ jobs:
     - name: Build x64
       if: env.SKIP_RELEASE != 'true'
       run: |
-        meson setup src/build-x64 src --cross-file src/llvm-win64.txt --buildtype release -Db_ndebug=true -Dstrip=true
+        meson setup src/build-x64 src --cross-file src/llvm-win64.txt --buildtype release -Db_ndebug=true -Dstrip=false
         ninja -C src/build-x64 -j 2
     - name: Build x86
       if: env.SKIP_RELEASE != 'true'
       run: |
-        meson setup src/build-x86 src --cross-file src/llvm-win32.txt --buildtype release -Db_ndebug=true -Dstrip=true
+        meson setup src/build-x86 src --cross-file src/llvm-win32.txt --buildtype release -Db_ndebug=true -Dstrip=false
         ninja -C src/build-x86 -j 2
     - name: Create Package
       if: env.SKIP_RELEASE != 'true'
@@ -190,7 +190,6 @@ jobs:
           SRC=$(find src/build-x86 -name "$dll" -type f | head -1)
           [[ -n "$SRC" ]] && cp "$SRC" pkg/syswow64/
         done
-        llvm-strip --strip-all pkg/system32/*.dll pkg/syswow64/*.dll
         cat > pkg/profile.json << JSONEOF
         {
           "type": "VKD3D",
