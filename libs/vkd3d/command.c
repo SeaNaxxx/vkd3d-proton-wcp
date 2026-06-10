@@ -140,9 +140,18 @@ HRESULT vkd3d_queue_create(struct d3d12_device *device, uint32_t family_index, u
         return hresult_from_errno(rc);
     }
 
+    if ((rc = pthread_mutex_init(&object->command_queue_mutex, NULL)))
+    {
+        ERR("Failed to initialize mutex, error %d.\n", rc);
+        pthread_mutex_destroy(&object->mutex);
+        vkd3d_free(object);
+        return hresult_from_errno(rc);
+    }
+
     if ((rc = pthread_mutex_init(&object->fence_mutex, NULL)))
     {
         ERR("Failed to initialize mutex, error %d.\n", rc);
+        pthread_mutex_destroy(&object->command_queue_mutex);
         pthread_mutex_destroy(&object->mutex);
         vkd3d_free(object);
         return hresult_from_errno(rc);
@@ -152,6 +161,7 @@ HRESULT vkd3d_queue_create(struct d3d12_device *device, uint32_t family_index, u
     {
         ERR("Failed to initialize cond, error %d.\n", rc);
         pthread_mutex_destroy(&object->mutex);
+        pthread_mutex_destroy(&object->command_queue_mutex);
         pthread_mutex_destroy(&object->fence_mutex);
         vkd3d_free(object);
         return hresult_from_errno(rc);
@@ -227,6 +237,7 @@ fail_free_command_pool:
     VK_CALL(vkDestroyCommandPool(device->vk_device, object->barrier_pool, NULL));
 fail_destroy_mutex:
     pthread_mutex_destroy(&object->mutex);
+    pthread_mutex_destroy(&object->command_queue_mutex);
     pthread_mutex_destroy(&object->fence_mutex);
     pthread_cond_destroy(&object->fence_cond);
     return hr;
@@ -301,6 +312,7 @@ void vkd3d_queue_destroy(struct vkd3d_queue *queue, struct d3d12_device *device)
     VK_CALL(vkDestroySemaphore(device->vk_device, queue->submission_timeline, NULL));
 
     pthread_mutex_destroy(&queue->mutex);
+    pthread_mutex_destroy(&queue->command_queue_mutex);
     vkd3d_free(queue->command_queues);
     vkd3d_free(queue->wait_semaphores);
 
@@ -567,6 +579,13 @@ VkResult vkd3d_queue_wait_submission_timeline(struct vkd3d_queue *queue, uint64_
     return vr;
 }
 
+static void vkd3d_queue_update_observed_cpu_timeline(struct vkd3d_queue *queue, uint64_t timeline)
+{
+    pthread_mutex_lock(&queue->fence_mutex);
+    queue->cpu_observed_timeline_value = max(queue->cpu_observed_timeline_value, timeline);
+    pthread_mutex_unlock(&queue->fence_mutex);
+}
+
 void vkd3d_add_wait_to_all_queues(struct d3d12_device *device, VkSemaphore vk_semaphore, uint64_t value)
 {
     struct vkd3d_queue_family_info *queue_family;
@@ -657,8 +676,6 @@ struct vkd3d_waiting_fence_submission_info
 {
     struct d3d12_command_allocator **command_allocators;
     size_t num_command_allocators;
-    struct d3d12_resource **retained_resources;
-    size_t num_retained_resources;
 };
 
 static void vkd3d_waiting_fence_release_submission(struct vkd3d_fence_worker *worker,
@@ -671,11 +688,6 @@ static void vkd3d_waiting_fence_release_submission(struct vkd3d_fence_worker *wo
         d3d12_command_allocator_dec_ref(info->command_allocators[i]);
 
     vkd3d_free(info->command_allocators);
-
-    for (i = 0; i < info->num_retained_resources; i++)
-        d3d12_resource_decref_retained(info->retained_resources[i]);
-
-    vkd3d_free(info->retained_resources);
 }
 
 struct vkd3d_waiting_fence_sparse_bind_info
@@ -833,6 +845,8 @@ static void vkd3d_wait_for_gpu_timeline_semaphore(struct vkd3d_fence_worker *wor
         else
         {
             vr = VK_CALL(vkWaitSemaphores(device->vk_device, &wait_info, timeout));
+            if (vr == VK_SUCCESS && fence->fence_info.vk_semaphore == queue->vkd3d_queue->submission_timeline)
+                vkd3d_queue_update_observed_cpu_timeline(queue->vkd3d_queue, fence->fence_info.vk_semaphore_value);
         }
 
         if (vr != VK_SUCCESS)
@@ -2798,30 +2812,6 @@ static void d3d12_command_allocator_retain_descriptor_heap(struct d3d12_command_
     allocator->descriptor_heaps[allocator->descriptor_heaps_count++] = heap;
 }
 
-static void d3d12_command_list_register_used_resource(struct d3d12_command_list *list,
-        struct d3d12_resource *resource)
-{
-    size_t i;
-    if (!resource)
-        return;
-
-#ifndef VKD3D_ENABLE_BREADCRUMBS
-    if (!(resource->flags & VKD3D_RESOURCE_RETAINED_GPU_REFERENCE))
-        return;
-#endif
-
-    for (i = 0; i < list->retained_resources_count; i++)
-        if (list->retained_resources[i] == resource)
-            return;
-
-    if (!vkd3d_array_reserve((void **)&list->retained_resources, &list->retained_resources_size,
-            list->retained_resources_count + 1, sizeof(*list->retained_resources)))
-        return;
-
-    d3d12_resource_incref_weak(resource);
-    list->retained_resources[list->retained_resources_count++] = resource;
-}
-
 static void d3d12_command_list_allocator_destroyed(struct d3d12_command_list *list)
 {
     TRACE("list %p.\n", list);
@@ -3240,56 +3230,6 @@ struct vkd3d_queue_family_info *d3d12_device_get_vkd3d_queue_family(struct d3d12
     }
 }
 
-/* This is used for workaround purposes for when some games screw up use-after-free of in-flight resources.
- * If resources are destroyed in-flight that's usually fine since GPU page tables are not updated
- * while a submission is in flight, but since we thread the actual submissions, we might observe behavior
- * that might not happen on Windows.
- * For workaround purposes, it's enough that we just defer the actual final decref until all dependent
- * vkQueueSubmit calls have gone through on CPU timeline.
- * This can be extended as needed to deal with GPU timeline too, but that's only relevant if truly needed,
- * since it will dramatically increase complexity and CPU overhead. */
-void d3d12_device_add_queue_timeline_deferred_decref(struct d3d12_device *device,
-        void (*inc_call)(void *), void (*dec_call)(void *), void *userdata, bool postpone_decref)
-{
-    struct vkd3d_queue_family_info *queue_family;
-    struct d3d12_command_queue_submission sub;
-    unsigned int i, j, family_index;
-    struct vkd3d_queue *vk_queue;
-
-    for (family_index = 0; family_index < ARRAY_SIZE(device->queue_families); family_index++)
-    {
-        queue_family = device->queue_families[family_index];
-        if (!queue_family)
-            continue;
-
-        /* Only use unique queue families. */
-        for (i = 0; i < family_index; i++)
-            if (device->queue_families[i] == queue_family)
-                break;
-
-        if (i < family_index)
-            continue;
-
-        for (i = 0; i < queue_family->queue_count; i++)
-        {
-            vk_queue = queue_family->queues[i];
-            pthread_mutex_lock(&vk_queue->mutex);
-            for (j = 0; j < vk_queue->command_queue_count; j++)
-            {
-                sub.type = VKD3D_SUBMISSION_CPU_TIMELINE_CALLBACK;
-                sub.callback.callback = dec_call;
-                sub.callback.userdata = userdata;
-                inc_call(userdata);
-                d3d12_command_queue_add_submission(vk_queue->command_queues[j], &sub);
-            }
-            pthread_mutex_unlock(&vk_queue->mutex);
-        }
-    }
-
-    if (!postpone_decref)
-        dec_call(userdata);
-}
-
 struct vkd3d_queue *d3d12_device_allocate_vkd3d_queue(struct vkd3d_queue_family_info *queue_family,
         struct d3d12_command_queue *command_queue)
 {
@@ -3297,7 +3237,7 @@ struct vkd3d_queue *d3d12_device_allocate_vkd3d_queue(struct vkd3d_queue_family_
     unsigned int i;
 
     for (i = 0; i < queue_family->queue_count; i++)
-        pthread_mutex_lock(&queue_family->queues[i]->mutex);
+        pthread_mutex_lock(&queue_family->queues[i]->command_queue_mutex);
 
     /* Select the queue that has the lowest number of virtual queues mapped
      * to it, in order to avoid situations where we map multiple queues to
@@ -3321,7 +3261,7 @@ struct vkd3d_queue *d3d12_device_allocate_vkd3d_queue(struct vkd3d_queue_family_
     }
 
     for (i = 0; i < queue_family->queue_count; i++)
-        pthread_mutex_unlock(&queue_family->queues[i]->mutex);
+        pthread_mutex_unlock(&queue_family->queues[i]->command_queue_mutex);
 
     return queue;
 }
@@ -3330,7 +3270,7 @@ void d3d12_device_unmap_vkd3d_queue(struct vkd3d_queue *queue, struct d3d12_comm
 {
     size_t i;
 
-    pthread_mutex_lock(&queue->mutex);
+    pthread_mutex_lock(&queue->command_queue_mutex);
     queue->virtual_queue_count--;
 
     if (command_queue)
@@ -3346,7 +3286,7 @@ void d3d12_device_unmap_vkd3d_queue(struct vkd3d_queue *queue, struct d3d12_comm
         }
     }
 
-    pthread_mutex_unlock(&queue->mutex);
+    pthread_mutex_unlock(&queue->command_queue_mutex);
 }
 
 static HRESULT d3d12_command_allocator_init(struct d3d12_command_allocator *allocator,
@@ -6708,8 +6648,6 @@ static void d3d12_command_list_track_resource_usage(struct d3d12_command_list *l
         transition.resource.perform_initial_transition = perform_initial_transition;
         d3d12_command_list_add_transition(list, &transition);
     }
-
-    d3d12_command_list_register_used_resource(list, resource);
 }
 
 static void d3d12_command_list_track_query_heap(struct d3d12_command_list *list,
@@ -6799,7 +6737,6 @@ ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *ifa
     if (!refcount)
     {
         struct d3d12_device *device = list->device;
-        size_t i;
 
         d3d_destruction_notifier_free(&list->destruction_notifier);
         vkd3d_private_store_destroy(&list->private_store);
@@ -6822,9 +6759,6 @@ ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *ifa
         vkd3d_free(list->dsv_resource_tracking);
         vkd3d_free(list->subresource_tracking);
         vkd3d_free(list->query_resolves);
-        for (i = 0; i < list->retained_resources_count; i++)
-            d3d12_resource_decref_weak(list->retained_resources[i]);
-        vkd3d_free(list->retained_resources);
         vkd3d_free(list->dgc_batch.draws);
         hash_map_free(&list->query_resolve_lut);
         d3d12_command_list_free_rtas_batch(list);
@@ -7383,8 +7317,6 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
 
 static void d3d12_command_list_reset_internal_state(struct d3d12_command_list *list)
 {
-    size_t i;
-
 #ifdef VKD3D_ENABLE_RENDERDOC
     list->debug_capture = vkd3d_renderdoc_active() && vkd3d_renderdoc_should_capture_shader_hash(0);
 #else
@@ -7406,10 +7338,6 @@ static void d3d12_command_list_reset_internal_state(struct d3d12_command_list *l
     list->query_resolve_count = 0;
     list->submit_allocator = NULL;
     list->dgc_batch.draws_count = 0;
-
-    for (i = 0; i < list->retained_resources_count; i++)
-        d3d12_resource_decref_weak(list->retained_resources[i]);
-    list->retained_resources_count = 0;
 
 #ifdef VKD3D_ENABLE_PROFILING
     vkd3d_timestamp_profiler_reset_command_list(list->device->timestamp_profiler, list);
@@ -22293,13 +22221,18 @@ ULONG STDMETHODCALLTYPE d3d12_command_queue_Release(ID3D12CommandQueue *iface)
         d3d_destruction_notifier_free(&command_queue->destruction_notifier);
         vkd3d_private_store_destroy(&command_queue->private_store);
 
+        /* It's important to unmap the queue first, before we send the STOP signal.
+         * Once the STOP signal has been received by command queue thread,
+         * it will no longer process commands.
+         * This can be a problem for unrelated code like resource retaining
+         * that attempts to loop over mapped queues and send submits to them. */
+        d3d12_device_unmap_vkd3d_queue(command_queue->vkd3d_queue, command_queue);
+
         d3d12_command_queue_submit_stop(command_queue);
 
         pthread_join(command_queue->submission_thread, NULL);
         pthread_mutex_destroy(&command_queue->queue_lock);
         pthread_cond_destroy(&command_queue->queue_cond);
-
-        d3d12_device_unmap_vkd3d_queue(command_queue->vkd3d_queue, command_queue);
 
         vkd3d_fence_worker_stop(&command_queue->fence_worker, device);
 
@@ -22735,12 +22668,10 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     size_t num_transitions, num_command_buffers;
     VkCommandBufferSubmitInfo *buffers, *buffer;
     struct d3d12_command_allocator **allocators;
-    struct d3d12_resource **retained_resources;
     struct d3d12_command_queue_submission sub;
     unsigned int indirect_barrier_hoist_index;
     unsigned int fixup_sink_begin_index;
     struct d3d12_command_list *cmd_list;
-    size_t num_retained_resources = 0;
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     unsigned int *breadcrumb_indices;
 #endif
@@ -22823,19 +22754,6 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
                         cmd_list, d3d12_command_list_from_iface(command_lists[i + 1]), hazard_query_resets,
                         i >= indirect_barrier_hoist_index)))
             num_command_buffers++;
-
-        num_retained_resources += cmd_list->retained_resources_count;
-        for (iter = 0; iter < cmd_list->retained_resources_count; iter++)
-        {
-            if (vkd3d_atomic_uint32_load_explicit(
-                    &cmd_list->retained_resources[iter]->internal_refcount, vkd3d_memory_order_relaxed) == 0)
-            {
-                ERR("Trying to execute resource which has already been destroyed. This will likely hang GPU.\n");
-                /* TODO: We could mark device as lost, or just ignore this submit. Hard to tell
-                 * what the appropriate action is. Future workarounds may have to guide our decision here. */
-                return;
-            }
-        }
     }
 
     if (!(buffers = vkd3d_calloc(num_command_buffers, sizeof(*buffers))))
@@ -22863,12 +22781,6 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     else
         breadcrumb_indices = NULL;
 #endif
-
-    if (num_retained_resources)
-        retained_resources = vkd3d_malloc(sizeof(*retained_resources) * num_retained_resources);
-    else
-        retained_resources = NULL;
-    num_retained_resources = 0;
 
     timeline_cookie = vkd3d_queue_timeline_trace_register_execute(
             &command_queue->device->queue_timeline_trace,
@@ -22940,7 +22852,6 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
             vkd3d_free(allocators);
             vkd3d_free(buffers);
             vkd3d_free(cmd_cost);
-            vkd3d_free(retained_resources);
 #ifdef VKD3D_ENABLE_BREADCRUMBS
             vkd3d_free(breadcrumb_indices);
 #endif
@@ -23080,9 +22991,6 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
             sub.execute.split_submission = true;
         }
 
-        for (iter = 0; iter < cmd_list->retained_resources_count; iter++)
-            retained_resources[num_retained_resources++] = cmd_list->retained_resources[iter];
-
 #ifdef VKD3D_ENABLE_BREADCRUMBS
         if (breadcrumb_indices)
             breadcrumb_indices[i] = cmd_list->breadcrumb_context_index;
@@ -23148,12 +23056,8 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     sub.execute.cmd_count = cmd_submit_count;
     sub.execute.command_allocators = allocators;
     sub.execute.num_command_allocators = command_list_count;
-    sub.execute.retained_resources = retained_resources;
-    sub.execute.num_retained_resources = num_retained_resources;
     for (i = 0; i < command_list_count; i++)
         d3d12_command_allocator_inc_ref(allocators[i]);
-    for (i = 0; i < num_retained_resources; i++)
-        d3d12_resource_incref(retained_resources[i]);
     sub.execute.low_latency_frame_id = command_queue->device->frame_markers.render;
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     sub.execute.breadcrumb_indices = breadcrumb_indices;
@@ -23355,16 +23259,19 @@ static CONST_VTBL struct ID3D12CommandQueueVtbl d3d12_command_queue_vtbl =
     d3d12_command_queue_GetDesc,
 };
 
-static bool d3d12_command_queue_needs_cpu_waits_locked(struct d3d12_command_queue *command_queue)
+static bool d3d12_command_queue_needs_cpu_waits(struct d3d12_command_queue *command_queue)
 {
     uint64_t current_time_ns, queue_submit_time_ns;
+    bool ret = false;
     unsigned int i;
-
-    if (command_queue->vkd3d_queue->command_queue_count == 1)
-        return false;
 
     if (VKD3D_CONFIG_FLAG_IS_SET(NO_STAGGERED_SUBMIT))
         return false;
+
+    pthread_mutex_lock(&command_queue->vkd3d_queue->command_queue_mutex);
+
+    if (command_queue->vkd3d_queue->command_queue_count == 1)
+        goto unlock;
 
     current_time_ns = vkd3d_get_current_time_ns();
 
@@ -23380,10 +23287,15 @@ static bool d3d12_command_queue_needs_cpu_waits_locked(struct d3d12_command_queu
         queue_submit_time_ns = vkd3d_atomic_uint64_load_explicit(&q->last_submission_time_ns, vkd3d_memory_order_relaxed);
 
         if (queue_submit_time_ns + VKD3D_QUEUE_INACTIVE_THRESHOLD_NS > current_time_ns)
-            return true;
+        {
+            ret = true;
+            goto unlock;
+        }
     }
 
-    return false;
+unlock:
+    pthread_mutex_unlock(&command_queue->vkd3d_queue->command_queue_mutex);
+    return ret;
 }
 
 static void d3d12_command_queue_destroy_serializing_semaphore(struct d3d12_command_queue *command_queue)
@@ -23706,11 +23618,8 @@ static void d3d12_command_queue_wait(struct d3d12_command_queue *command_queue,
     struct vkd3d_queue_timeline_trace_cookie cookie;
     struct d3d12_fence_value fence_value;
     VkSemaphoreWaitInfo wait_info;
-    struct vkd3d_queue *queue;
     bool has_wait;
     VkResult vr;
-
-    queue = command_queue->vkd3d_queue;
 
     assert(!fence->timeline_semaphore);
 
@@ -23738,12 +23647,8 @@ static void d3d12_command_queue_wait(struct d3d12_command_queue *command_queue,
     TRACE("queue %p, fence %p, value %#"PRIx64", vk_semaphore %p, vk_semaphore_value %#"PRIx64".\n", command_queue,
             fence, value, fence_value.vk_semaphore, fence_value.vk_semaphore_value);
 
-    pthread_mutex_lock(&queue->mutex);
-
-    if (d3d12_command_queue_needs_cpu_waits_locked(command_queue))
+    if (d3d12_command_queue_needs_cpu_waits(command_queue))
     {
-        pthread_mutex_unlock(&queue->mutex);
-
         d3d12_command_queue_ensure_fence_signal_order(command_queue, fence, fence_value.update_count);
 
         memset(&wait_info, 0, sizeof(wait_info));
@@ -23759,8 +23664,6 @@ static void d3d12_command_queue_wait(struct d3d12_command_queue *command_queue,
     }
     else
     {
-        pthread_mutex_unlock(&queue->mutex);
-
         /* Defer the wait to next submit.
          * This is also important, since we have to hold on to a private reference on the fence
          * until we have observed the wait to actually complete. */
@@ -23913,6 +23816,37 @@ static void d3d12_command_queue_signal_shared(struct d3d12_command_queue *comman
     }
 
     /* We should probably trigger DEVICE_REMOVED if we hit any errors in the submission thread. */
+}
+
+struct vkd3d_waiting_fence_defer_release_resource_info
+{
+    struct d3d12_resource *resource;
+};
+
+static void vkd3d_waiting_fence_release_resource(struct vkd3d_fence_worker *worker,
+        void *userdata, bool complete)
+{
+    struct vkd3d_waiting_fence_defer_release_resource_info *info = userdata;
+    d3d12_resource_decref(info->resource);
+}
+
+static void d3d12_command_queue_defer_release_resource(struct d3d12_command_queue *command_queue,
+                                                       struct d3d12_resource *resource)
+{
+    struct vkd3d_waiting_fence_defer_release_resource_info *release_info;
+    struct vkd3d_fence_wait_info fence_info;
+    HRESULT hr;
+
+    memset(&fence_info, 0, sizeof(fence_info));
+    fence_info.vk_semaphore = command_queue->vkd3d_queue->submission_timeline;
+    fence_info.vk_semaphore_value = command_queue->last_submission_timeline_value;
+
+    release_info = vkd3d_waiting_fence_set_callback(&fence_info,
+            &vkd3d_waiting_fence_release_resource, sizeof(*release_info));
+    release_info->resource = resource;
+
+    if (FAILED(hr = vkd3d_enqueue_timeline_semaphore(&command_queue->fence_worker, &fence_info, NULL)))
+        ERR("Failed to enqueue timeline semaphore, hr #%x.\n", (int)hr);
 }
 
 #define VKD3D_COMMAND_QUEUE_NUM_TRANSITION_BUFFERS 16
@@ -24251,14 +24185,12 @@ static void d3d12_command_queue_wait_staggered_submission(struct d3d12_command_q
         ERR("Failed to wait for semaphore, vr %d.\n", vr);
 }
 
-static bool d3d12_command_queue_needs_staggered_submissions_locked(struct d3d12_command_queue *command_queue)
+static bool d3d12_command_queue_needs_staggered_submissions(struct d3d12_command_queue *command_queue)
 {
     uint64_t current_time_ns, queue_submit_time_ns;
     int32_t max_priority;
+    bool ret = false;
     unsigned int i;
-
-    if (command_queue->vkd3d_queue->command_queue_count == 1)
-        return false;
 
     if (VKD3D_CONFIG_FLAG_IS_SET(NO_STAGGERED_SUBMIT))
         return false;
@@ -24266,6 +24198,11 @@ static bool d3d12_command_queue_needs_staggered_submissions_locked(struct d3d12_
     /* Cannot meaningfully stagger submits if we're doing suspend resume style render passes. */
     if (command_queue->device->workarounds.tiler_suspend_resume)
         return false;
+
+    pthread_mutex_lock(&command_queue->vkd3d_queue->command_queue_mutex);
+
+    if (command_queue->vkd3d_queue->command_queue_count == 1)
+        goto unlock;
 
     current_time_ns = vkd3d_get_current_time_ns();
 
@@ -24291,12 +24228,15 @@ static bool d3d12_command_queue_needs_staggered_submissions_locked(struct d3d12_
              * devices with one queue family, or when setting single_queue. */
             if (q->desc.Type != command_queue->desc.Type &&
                     (q->desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT || command_queue->desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT))
-                return true;
+            {
+                ret = true;
+                goto unlock;
+            }
         }
     }
 
     if (command_queue->desc.Priority == max_priority)
-        return false;
+        goto unlock;
 
     /* Otherwise, submit command buffers from this queue one by one in order
      * to allow work from an active high-priority queue to get scheduled sooner.
@@ -24304,7 +24244,11 @@ static bool d3d12_command_queue_needs_staggered_submissions_locked(struct d3d12_
      * one graphics queue, since UI composition and presentation are submitted
      * mid-frame without any explicit synchronization between the two graphics
      * queues. */
-    return true;
+    ret = true;
+
+unlock:
+    pthread_mutex_unlock(&command_queue->vkd3d_queue->command_queue_mutex);
+    return ret;
 }
 
 static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queue,
@@ -24340,15 +24284,14 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
     TRACE("queue %p, command_list_count %u, command_lists %p.\n",
           command_queue, exec->cmd_count, exec->cmd);
 
+    stagger_submissions = d3d12_command_queue_needs_staggered_submissions(command_queue);
+
     if (!(vk_queue = vkd3d_queue_acquire(vkd3d_queue)))
     {
         ERR("Failed to acquire queue %p.\n", vkd3d_queue);
         for (i = 0; i < exec->num_command_allocators; i++)
             d3d12_command_allocator_dec_ref(exec->command_allocators[i]);
-        for (i = 0; i < exec->num_retained_resources; i++)
-            d3d12_resource_decref_retained(exec->retained_resources[i]);
         vkd3d_free(exec->command_allocators);
-        vkd3d_free(exec->retained_resources);
         vkd3d_queue_timeline_trace_complete_execute(&command_queue->device->queue_timeline_trace,
                 NULL, exec->timeline_cookie);
         return;
@@ -24365,8 +24308,6 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
     else
         debug_capture = false;
 #endif
-
-    stagger_submissions = d3d12_command_queue_needs_staggered_submissions_locked(command_queue);
 
     if (command_queue->stagger_submissions != stagger_submissions)
     {
@@ -24644,8 +24585,6 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
                 &vkd3d_waiting_fence_release_submission, sizeof(*submission_info));
         submission_info->command_allocators = exec->command_allocators;
         submission_info->num_command_allocators = exec->num_command_allocators;
-        submission_info->retained_resources = exec->retained_resources;
-        submission_info->num_retained_resources = exec->num_retained_resources;
 
         if (FAILED(hr = vkd3d_enqueue_timeline_semaphore(&command_queue->fence_worker, &fence_info, &exec->timeline_cookie)))
         {
@@ -25126,9 +25065,10 @@ void d3d12_command_queue_enqueue_callback(struct d3d12_command_queue *queue, voi
     d3d12_command_queue_add_submission(queue, &sub);
 }
 
-static void d3d12_command_queue_add_submission_locked(struct d3d12_command_queue *queue,
-                                                      const struct d3d12_command_queue_submission *sub)
+void d3d12_command_queue_add_submission_locked(struct d3d12_command_queue *queue,
+                                               const struct d3d12_command_queue_submission *sub)
 {
+    vkd3d_atomic_uint32_increment(&queue->inflight_submissions, vkd3d_memory_order_relaxed);
     vkd3d_array_reserve((void**)&queue->submissions, &queue->submissions_size,
                         queue->submissions_count + 1, sizeof(*queue->submissions));
     queue->submissions[queue->submissions_count++] = *sub;
@@ -25344,9 +25284,8 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
             submission.callback.callback(submission.callback.userdata);
             break;
 
-        case VKD3D_SUBMISSION_CPU_TIMELINE_CALLBACK:
-            cookie = vkd3d_queue_timeline_trace_register_generic_region(&queue->device->queue_timeline_trace, "CPU_CALLBACK");
-            submission.callback.callback(submission.callback.userdata);
+        case VKD3D_SUBMISSION_RESOURCE_RETAIN:
+            d3d12_command_queue_defer_release_resource(queue, submission.resource);
             break;
 
         default:
@@ -25354,6 +25293,7 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
             break;
         }
 
+        vkd3d_atomic_uint32_decrement(&queue->inflight_submissions, vkd3d_memory_order_release);
         vkd3d_queue_timeline_trace_complete_execute(&queue->device->queue_timeline_trace, &queue->fence_worker, cookie);
     }
 

@@ -966,6 +966,10 @@ HRESULT vkd3d_memory_transfer_queue_flush(struct vkd3d_memory_transfer_queue *qu
 HRESULT vkd3d_memory_transfer_queue_write_subresource(struct vkd3d_memory_transfer_queue *queue,
         struct d3d12_resource *resource, uint32_t subresource_idx, VkOffset3D offset, VkExtent3D extent);
 HRESULT vkd3d_memory_transfer_queue_build_empty_rtas(struct vkd3d_memory_transfer_queue *queue);
+bool vkd3d_memory_transfer_queue_poll_allocation_idle(struct vkd3d_memory_transfer_queue *queue,
+        const struct vkd3d_memory_allocation *allocation);
+bool vkd3d_memory_transfer_queue_clear_in_flight(struct vkd3d_memory_transfer_queue *queue,
+        const struct vkd3d_memory_allocation *allocation);
 
 struct vkd3d_memory_allocator
 {
@@ -1158,7 +1162,6 @@ struct d3d12_resource
     d3d12_resource_iface ID3D12Resource_iface;
     LONG refcount;
     LONG internal_refcount;
-    LONG weak_count;
 
     D3D12_RESOURCE_DESC1 desc;
     D3D12_HEAP_PROPERTIES heap_properties;
@@ -1221,10 +1224,6 @@ static inline VkImageLayout d3d12_resource_pick_layout(const struct d3d12_resour
 
 ULONG d3d12_resource_incref(struct d3d12_resource *resource);
 ULONG d3d12_resource_decref(struct d3d12_resource *resource);
-/* Only called by fence worker. Adds detection for use-after-free in debug builds. */
-void d3d12_resource_decref_retained(struct d3d12_resource *resource);
-void d3d12_resource_incref_weak(struct d3d12_resource *resource);
-void d3d12_resource_decref_weak(struct d3d12_resource *resource);
 
 struct vkd3d_cookie vkd3d_allocate_cookie(void);
 UINT vkd3d_allocate_cookie_va_timestamp(void);
@@ -3452,10 +3451,6 @@ struct d3d12_command_list
     size_t query_resolve_count;
     size_t query_resolve_size;
 
-    struct d3d12_resource **retained_resources;
-    size_t retained_resources_size;
-    size_t retained_resources_count;
-
     struct hash_map query_resolve_lut;
 
     struct d3d12_transfer_batch_state transfer_batch;
@@ -3628,6 +3623,7 @@ struct vkd3d_queue
     uint32_t timestamp_bits;
     uint32_t virtual_queue_count;
 
+    pthread_mutex_t command_queue_mutex;
     struct d3d12_command_queue **command_queues;
     size_t command_queue_size;
     size_t command_queue_count;
@@ -3683,8 +3679,8 @@ enum vkd3d_submission_type
     VKD3D_SUBMISSION_BIND_SPARSE,
     VKD3D_SUBMISSION_STOP,
     VKD3D_SUBMISSION_QUEUE_USING_CALLBACK,
-    VKD3D_SUBMISSION_CPU_TIMELINE_CALLBACK,
-    VKD3D_SUBMISSION_DRAIN
+    VKD3D_SUBMISSION_DRAIN,
+    VKD3D_SUBMISSION_RESOURCE_RETAIN
 };
 
 enum vkd3d_sparse_memory_bind_mode
@@ -3734,9 +3730,6 @@ struct d3d12_command_queue_submission_execute
     struct vkd3d_initial_transition *transitions;
     size_t transition_count;
 
-    struct d3d12_resource **retained_resources;
-    UINT num_retained_resources;
-
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     /* Replays commands in submission order for heavy debug. */
     unsigned int *breadcrumb_indices;
@@ -3774,6 +3767,7 @@ struct d3d12_command_queue_submission
         struct d3d12_command_queue_submission_execute execute;
         struct d3d12_command_queue_submission_bind_sparse bind_sparse;
         struct d3d12_command_queue_submission_callback callback;
+        struct d3d12_resource *resource;
     };
 };
 
@@ -3871,6 +3865,8 @@ struct d3d12_command_queue
     VkSemaphore serializing_semaphore;
     bool serializing_semaphore_signaled;
 
+    uint32_t inflight_submissions;
+
     struct
     {
         uint32_t buffer_binds_count;
@@ -3899,6 +3895,8 @@ HRESULT d3d12_command_queue_create(struct d3d12_device *device,
 void d3d12_command_queue_submit_stop(struct d3d12_command_queue *queue);
 void d3d12_command_queue_signal_inline(struct d3d12_command_queue *queue, d3d12_fence_iface *fence, uint64_t value);
 void d3d12_command_queue_enqueue_callback(struct d3d12_command_queue *queue, void (*callback)(void *), void *userdata);
+void d3d12_command_queue_add_submission_locked(struct d3d12_command_queue *queue,
+                                               const struct d3d12_command_queue_submission *sub);
 
 struct vkd3d_execute_indirect_info
 {
@@ -5849,8 +5847,6 @@ struct vkd3d_queue_family_info *d3d12_device_get_vkd3d_queue_family(struct d3d12
         uint32_t vk_family_index);
 struct vkd3d_queue *d3d12_device_allocate_vkd3d_queue(struct vkd3d_queue_family_info *queue_family,
         struct d3d12_command_queue *command_queue);
-void d3d12_device_add_queue_timeline_deferred_decref(struct d3d12_device *device,
-        void (*inc_call)(void *), void (*dec_call)(void *), void *userdata, bool postpone_decref);
 void d3d12_device_unmap_vkd3d_queue(struct vkd3d_queue *queue, struct d3d12_command_queue *command_queue);
 bool d3d12_device_is_uma(struct d3d12_device *device, bool *coherent);
 void d3d12_device_mark_as_removed(struct d3d12_device *device, HRESULT reason,
