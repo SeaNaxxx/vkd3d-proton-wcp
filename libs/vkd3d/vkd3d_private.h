@@ -2985,7 +2985,7 @@ struct vkd3d_rendering_info
 };
 
 /* ID3D12CommandListExt */
-typedef ID3D12GraphicsCommandListExt1 d3d12_command_list_vkd3d_ext_iface;
+typedef ID3D12GraphicsCommandListExt2 d3d12_command_list_vkd3d_ext_iface;
 
 struct d3d12_rt_state_object;
 
@@ -5442,7 +5442,7 @@ struct vkd3d_descriptor_qa_heap_buffer_data;
 struct vkd3d_timestamp_profiler;
 
 /* ID3D12DeviceExt */
-typedef ID3D12DeviceExt4 d3d12_device_vkd3d_ext_iface;
+typedef ID3D12DeviceExt5 d3d12_device_vkd3d_ext_iface;
 
 /* ID3D12DXVKInteropDevice */
 typedef ID3D12DXVKInteropDevice3 d3d12_dxvk_interop_device_iface;
@@ -5837,6 +5837,11 @@ struct d3d12_device
         HMODULE amdxc64;
 #endif
         struct vkd3d_nv_shader nv_shader;
+
+        /* Set by SetCreatePipelineStateOptions (NVAPI). NVAPI has no per-pipeline OMM opt-in
+         * (unlike DXR 1.2's ALLOW_OPACITY_MICROMAPS flag), so this global is OR'd into every
+         * RT pipeline creation to implement the device-wide enable/disable semantic. */
+        VkPipelineCreateFlags global_ray_tracing_pipeline_create_flags;
     } vendor_hacks;
 
     bool independent_device;
@@ -6092,7 +6097,6 @@ static inline bool d3d12_device_use_ssbo_root_descriptors(struct d3d12_device *d
 bool d3d12_device_supports_variable_shading_rate_tier_1(struct d3d12_device *device);
 bool d3d12_device_supports_variable_shading_rate_tier_2(struct d3d12_device *device);
 bool d3d12_device_supports_ray_tracing_tier_1_0(const struct d3d12_device *device);
-bool d3d12_device_supports_ray_tracing_tier_1_2(const struct d3d12_device *device);
 UINT d3d12_determine_shading_rate_image_tile_size(struct d3d12_device *device);
 bool d3d12_device_supports_required_subgroup_size_for_stage(
         struct d3d12_device *device, VkShaderStageFlagBits stage);

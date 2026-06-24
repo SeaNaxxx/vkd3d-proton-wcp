@@ -95,7 +95,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(KHR_PRESENT_WAIT_2, KHR_present_wait2),
     VK_EXTENSION(EXT_PRESENT_TIMING, EXT_present_timing),
     VK_EXTENSION(KHR_DEVICE_ADDRESS_COMMANDS, KHR_device_address_commands),
-    VK_EXTENSION_COND(KHR_OPACITY_MICROMAP, KHR_opacity_micromap, VKD3D_CONFIG_FLAG_STATIC(DXR_1_2)),
+    VK_EXTENSION_DISABLE_COND(KHR_OPACITY_MICROMAP, KHR_opacity_micromap, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
 #ifdef _WIN32
     VK_EXTENSION(KHR_EXTERNAL_MEMORY_WIN32, KHR_external_memory_win32),
     VK_EXTENSION(KHR_EXTERNAL_SEMAPHORE_WIN32, KHR_external_semaphore_win32),
@@ -1697,12 +1697,6 @@ bool d3d12_device_supports_ray_tracing_tier_1_0(const struct d3d12_device *devic
     return device->device_info.acceleration_structure_features.accelerationStructure &&
             device->device_info.ray_tracing_pipeline_features.rayTracingPipeline &&
             device->d3d12_caps.options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0;
-}
-
-bool d3d12_device_supports_ray_tracing_tier_1_2(const struct d3d12_device *device)
-{
-    return device->device_info.supports_opacity_micromap &&
-            device->d3d12_caps.options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_2;
 }
 
 bool d3d12_device_supports_variable_shading_rate_tier_1(struct d3d12_device *device)
@@ -4610,7 +4604,8 @@ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
             || IsEqualGUID(riid, &IID_ID3D12DeviceExt1)
             || IsEqualGUID(riid, &IID_ID3D12DeviceExt2)
             || IsEqualGUID(riid, &IID_ID3D12DeviceExt3)
-            || IsEqualGUID(riid, &IID_ID3D12DeviceExt4))
+            || IsEqualGUID(riid, &IID_ID3D12DeviceExt4)
+            || IsEqualGUID(riid, &IID_ID3D12DeviceExt5))
     {
         d3d12_device_vkd3d_ext_AddRef(&device->ID3D12DeviceExt_iface);
         *object = &device->ID3D12DeviceExt_iface;
@@ -8457,7 +8452,7 @@ static void d3d12_device_get_raytracing_opacity_micromap_array_prebuild_info(str
     VkMicromapUsageKHR *usages;
     uint32_t usages_count;
 
-    if (!d3d12_device_supports_ray_tracing_tier_1_2(device))
+    if (!device->device_info.supports_opacity_micromap)
     {
         ERR("Opacity micromap is not supported. Calling this is invalid.\n");
         memset(info, 0, sizeof(*info));
@@ -10896,7 +10891,7 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
     }
 }
 
-extern CONST_VTBL struct ID3D12DeviceExt4Vtbl d3d12_device_vkd3d_ext_vtbl;
+extern CONST_VTBL struct ID3D12DeviceExt5Vtbl d3d12_device_vkd3d_ext_vtbl;
 extern CONST_VTBL struct ID3D12DXVKInteropDevice3Vtbl d3d12_dxvk_interop_device_vtbl;
 extern CONST_VTBL struct ID3DLowLatencyDeviceVtbl d3d_low_latency_device_vtbl;
 extern CONST_VTBL struct IAmdExtAntiLagApiVtbl d3d_amd_ext_anti_lag_vtbl;
@@ -10977,6 +10972,9 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
 
     device->adapter_luid = create_info->adapter_luid;
     device->removed_reason = S_OK;
+    vkd3d_atomic_uint32_store_explicit(
+            &device->vendor_hacks.global_ray_tracing_pipeline_create_flags, 0,
+            vkd3d_memory_order_relaxed);
 
     device->vk_device = VK_NULL_HANDLE;
 
