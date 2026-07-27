@@ -728,6 +728,9 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     /* Borderlands 4. Also UE, but uses different name. */
     { VKD3D_STRING_COMPARE_EXACT, "Borderlands4.exe",
             VKD3D_CONFIG_FLAG_INIT_STATIC(.SMALL_VRAM_REBAR = 1, .NO_STAGGERED_SUBMIT = 1) },
+    /* New halo is UE, but doesn't use standard UE naming. */
+    { VKD3D_STRING_COMPARE_EXACT, "HaloCampaignEvolved.exe",
+            VKD3D_CONFIG_FLAG_INIT_STATIC(.SMALL_VRAM_REBAR = 1, .NO_STAGGERED_SUBMIT = 1) },
     /* Rise of the Tomb Raider. Game renders and samples a texture at the same time */
     { VKD3D_STRING_COMPARE_EXACT, "ROTTR.exe", VKD3D_CONFIG_FLAG_STATIC(DISABLE_COLOR_COMPRESSION) },
     /* Death Stranding (Director's Cut and original). Massive CPU overhead due to reading from HVV in certain scenarios. */
@@ -3909,6 +3912,17 @@ static void d3d12_device_init_vendor_hacks(struct d3d12_device *device)
         if (device->vendor_hacks.amdxc64)
             INFO("Loaded amdxc64.dll successfully.\n");
     }
+
+    if (device->device_info.properties2.properties.vendorID == VKD3D_VENDOR_ID_INTEL)
+    {
+        char sysdir[MAX_PATH], path[MAX_PATH];
+        GetSystemDirectoryA(sysdir, sizeof(sysdir));
+        snprintf(path, sizeof(path),
+                "%s\\DriverStore\\FileRepository\\intc_wine\\igd10iumd64.dll", sysdir);
+        device->vendor_hacks.igd10iumd64 = LoadLibraryA(path);
+        if (device->vendor_hacks.igd10iumd64)
+            INFO("Loaded igd10iumd64.dll successfully.\n");
+    }
 #endif
 }
 
@@ -3919,6 +3933,8 @@ static void d3d12_device_cleanup_vendor_hacks(struct d3d12_device *device)
 #ifdef _WIN64
     if (device->vendor_hacks.amdxc64)
         FreeLibrary(device->vendor_hacks.amdxc64);
+    if (device->vendor_hacks.igd10iumd64)
+        FreeLibrary(device->vendor_hacks.igd10iumd64);
 #endif
 }
 
@@ -5429,6 +5445,11 @@ static bool d3d12_barrier_layout_is_supported(D3D12_COMMAND_LIST_TYPE type, D3D1
     static const D3D12_BARRIER_LAYOUT direct_queue_only_layouts[] =
     {
         D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COMMON,
+        D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ,
+        D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS,
+        D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE,
+        D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_SOURCE,
+        D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_DEST,
         D3D12_BARRIER_LAYOUT_RENDER_TARGET,
         D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ,
         D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE,
