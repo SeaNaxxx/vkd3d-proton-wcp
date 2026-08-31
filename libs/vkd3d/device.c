@@ -773,6 +773,12 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     /* World of Warcraft Classic */
     /* Like in retail WoW, descriptor type mismatches causes GPU hangs in a ray query shader without 64 byte descriptors */
     { VKD3D_STRING_COMPARE_EXACT, "WoWClassic.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(.AVOID_IMAGE_BUFFER_ALIASING = 1, .DESCRIPTOR_HEAP = 1) },
+    /* Teardown.
+     * Creates command signatures that modify vertex/index buffer views and root CBVs, which
+     * cannot be implemented without device generated commands. Silently dropping the state
+     * template makes those ExecuteIndirect draws disappear, and the game handles a failed
+     * CreateCommandSignature by issuing the draws from the CPU instead. */
+    { VKD3D_STRING_COMPARE_EXACT, "teardown.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(.FAIL_UNSUPPORTED_STATE_TEMPLATE = 1) },
     { VKD3D_STRING_COMPARE_NEVER, NULL },
 };
 
@@ -1114,6 +1120,15 @@ static const struct vkd3d_shader_quirk_info empire_of_the_ants_quirks = {
     NULL, 0, VKD3D_SHADER_QUIRK_CLAMP_WAVE_SIZE_TO_THREAD_GROUP32,
 };
 
+static const struct vkd3d_shader_quirk_hash plague_tale_resonance_hashes[] = {
+    { "ch_spawn", 0, VKD3D_SHADER_QUIRK_DESCRIPTOR_HEAP_ROBUSTNESS },
+    { "ch_update", 0, VKD3D_SHADER_QUIRK_DESCRIPTOR_HEAP_ROBUSTNESS },
+};
+
+static const struct vkd3d_shader_quirk_info plague_tale_resonance_robustness_quirks = {
+    plague_tale_resonance_hashes, ARRAY_SIZE(plague_tale_resonance_hashes), 0,
+};
+
 static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* F1 2020 (1080110) */
     { VKD3D_STRING_COMPARE_EXACT, "F1_2020_dx12.exe", &f1_2019_2020_quirks },
@@ -1205,6 +1220,8 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* MSVC fails to compile empty array. */
     /* World of Warcraft Classic */
     { VKD3D_STRING_COMPARE_EXACT, "WoWClassic.exe", &wow_classic_quirks },
+    /* Plague Tale Resonance (2713000). */
+    { VKD3D_STRING_COMPARE_EXACT, "Resonance.exe", &plague_tale_resonance_robustness_quirks },
     /* Empire of the Ants (2287330). With Terrain Tessellation on, some shaders
      * seem to assume Wave32 by mistake leading to GPU timeout. */
     { VKD3D_STRING_COMPARE_EXACT, "Empire-Win64-Shipping.exe", &empire_of_the_ants_quirks },
