@@ -623,7 +623,7 @@ static ULONG STDMETHODCALLTYPE dxgi_vk_swap_chain_AddRef(IDXGIVkSwapChain2 *ifac
     {
         dxgi_vk_swap_chain_incref(chain);
         ID3D12CommandQueue_AddRef(&chain->queue->ID3D12CommandQueue_iface);
-        d3d12_device_register_swapchain(chain->queue->device, chain);
+        d3d12_device_register_low_latency_swapchain(chain->queue->device, chain);
     }
 
     return refcount;
@@ -644,10 +644,7 @@ static ULONG STDMETHODCALLTYPE dxgi_vk_swap_chain_Release(IDXGIVkSwapChain2 *ifa
         /* Calling this from the submission thread will result in a deadlock, so
          * drain the swapchain queue now. */
         dxgi_vk_swap_chain_drain_queue(chain);
-
-        if (device->vk_info.NV_low_latency2)
-            d3d12_device_remove_swapchain(device, chain);
-
+        d3d12_device_remove_low_latency_swapchain(device, chain);
         dxgi_vk_swap_chain_decref(chain);
         ID3D12CommandQueue_Release(&queue->ID3D12CommandQueue_iface);
     }
@@ -1714,13 +1711,7 @@ static void dxgi_vk_swap_chain_destroy_swapchain_in_present_task(struct dxgi_vk_
     chain->present.current_backbuffer_index = UINT32_MAX;
 
     if (chain->queue->device->vk_info.NV_low_latency2)
-    {
-        spinlock_acquire(&chain->queue->device->low_latency_swapchain_spinlock);
-        chain->queue->device->swapchain_info.vk_swapchain_count--;
-        spinlock_release(&chain->queue->device->low_latency_swapchain_spinlock);
-
         pthread_mutex_unlock(&chain->present.low_latency_swapchain_lock);
-    }
 }
 
 static VkColorSpaceKHR convert_color_space(DXGI_COLOR_SPACE_TYPE dxgi_color_space)
@@ -2100,6 +2091,10 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
     if (chain->present.is_surface_lost)
         return;
 
+    /* Hard evidence that we're going ahead with swapchain creation, demote any existing LL2 chain
+     * that is not ourselves. */
+    d3d12_device_notify_vk_swapchain_creation(chain->queue->device, chain);
+
     /* If we fail to query formats we are hosed, treat it as a SURFACE_LOST scenario. */
     pthread_mutex_lock(&chain->properties.lock);
     /* This is only called on an event where we have to recreate the swapchain,
@@ -2283,18 +2278,6 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
     /* If low latency is supported restore the current low latency state now */
     if (chain->queue->device->vk_info.NV_low_latency2)
     {
-        struct d3d12_device *device = chain->queue->device;
-
-        spinlock_acquire(&device->low_latency_swapchain_spinlock);
-        device->swapchain_info.vk_swapchain_count++;
-
-        if (device->swapchain_info.vk_swapchain_count > 1 && device->swapchain_info.low_latency_swapchain)
-        {
-            dxgi_vk_swap_chain_decref(device->swapchain_info.low_latency_swapchain);
-            device->swapchain_info.low_latency_swapchain = NULL;
-        }
-        spinlock_release(&device->low_latency_swapchain_spinlock);
-
         dxgi_vk_swap_chain_set_low_latency_state(chain, &chain->present.low_latency_state);
         pthread_mutex_unlock(&chain->present.low_latency_swapchain_lock);
     }
@@ -3958,8 +3941,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_factory_CreateSwapChain(IDXG
         return hr;
     }
 
-    if (chain->queue->device->vk_info.NV_low_latency2)
-        d3d12_device_register_swapchain(chain->queue->device, chain);
+    d3d12_device_register_low_latency_swapchain(chain->queue->device, chain);
 
     *ppSwapchain = (IDXGIVkSwapChain*)&chain->IDXGIVkSwapChain_iface;
     return S_OK;

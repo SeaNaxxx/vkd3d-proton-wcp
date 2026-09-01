@@ -10424,7 +10424,8 @@ static bool d3d12_command_list_init_copy_texture_region(struct d3d12_command_lis
                 &src_resource->desc, out->src_format, out->dst_format, src_box, dst_x, dst_y, dst_z);
         out->copy.buffer_image.bufferOffset += dst_resource->mem.offset;
 
-        out->needs_conversion = (out->src_format->vk_aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) && out->src_format->is_emulated;
+        out->needs_conversion = (out->copy.buffer_image.imageSubresource.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+                out->src_format->is_emulated;
         out->src_layout = d3d12_resource_pick_layout(src_resource, out->needs_conversion
             ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         out->batch_type = VKD3D_BATCH_TYPE_COPY_IMAGE_TO_BUFFER;
@@ -10451,7 +10452,8 @@ static bool d3d12_command_list_init_copy_texture_region(struct d3d12_command_lis
                 &dst_resource->desc, out->src_format, out->dst_format, src_box, dst_x, dst_y, dst_z);
         out->copy.buffer_image.bufferOffset += src_resource->mem.offset;
 
-        out->needs_conversion = (out->dst_format->vk_aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) && out->dst_format->is_emulated;
+        out->needs_conversion = (out->copy.buffer_image.imageSubresource.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+                out->dst_format->is_emulated;
         out->dst_layout = d3d12_resource_pick_layout(dst_resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         out->writes_full_subresource = d3d12_image_copy_writes_full_subresource(dst_resource,
                 &out->copy.buffer_image.imageExtent, &out->copy.buffer_image.imageSubresource);
@@ -10770,9 +10772,12 @@ static bool d3d12_command_list_copy_requires_complex_barrier(
     if (!d3d12_device_supports_unified_layouts(list->device))
         return true;
 
-    /* We always handle these inline. */
+    /* We always handle these inline, unless the format is emulated. */
     if (info->batch_type == VKD3D_BATCH_TYPE_COPY_IMAGE_TO_BUFFER)
-        return false;
+    {
+        return (info->copy.buffer_image.imageSubresource.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+                info->src_format->is_emulated;
+    }
 
     /* Simple WAW hazards are OK, we can handle those inline. Mismatch in aspects might require fallback copies. */
     return info->writes_full_subresource ||
