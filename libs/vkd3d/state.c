@@ -3219,6 +3219,12 @@ static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, stru
                 subgroup_size_alignment = spirv_code->meta.cs_wave_size_preferred;
                 override_subgroup_size = true;
             }
+            else if (spirv_code->meta.cs_wave_size_max &&
+                    spirv_code->meta.cs_wave_size_max < device->d3d12_caps.options1.WaveLaneCountMin)
+            {
+                assert(spirv_code->meta.flags & VKD3D_SHADER_META_FLAG_ALLOW_WAVE32);
+                /* Just allow it to go through. Don't override anything. */
+            }
             else if (spirv_code->meta.cs_wave_size_min && (
                     spirv_code->meta.cs_wave_size_min > device->d3d12_caps.options1.WaveLaneCountMin ||
                     spirv_code->meta.cs_wave_size_max < device->d3d12_caps.options1.WaveLaneCountMax))
@@ -5961,7 +5967,10 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
                 if (instance_divisor > vk_info->max_vertex_attrib_divisor)
                 {
                     FIXME("Instance divisor %u not supported by Vulkan implementation.\n", instance_divisor);
-                    instance_divisor = 1;
+                    /* Intel devices limit this to <2^28, while some games request UINT_MAX,
+                     * with the intention to reuse the same attribute value for all instances. */
+                    instance_divisor = device->device_info.vertex_divisor_features.vertexAttributeInstanceRateZeroDivisor
+                            ? 0u : vk_info->max_vertex_attrib_divisor;
                 }
                 break;
 
