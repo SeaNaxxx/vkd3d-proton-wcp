@@ -423,6 +423,7 @@ enum vkd3d_shader_target_extension
     VKD3D_SHADER_TARGET_EXTENSION_MIN_PRECISION_IS_NATIVE_16BIT,
     VKD3D_SHADER_TARGET_EXTENSION_MIN_PRECISION_IS_RELAXED,
     VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP16_DENORM_PRESERVE,
+    VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP16_DENORM_PRESERVE_DEFAULT,
     VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP32_DENORM_FLUSH,
     VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP64_DENORM_PRESERVE,
     VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP16_INF_NAN_PRESERVE,
@@ -583,6 +584,11 @@ enum vkd3d_shader_target_extension
 /* Enforce a subgroup size of 64 or more.
  * Used for debugging only when bisecting where games screw up wave64. */
 #define VKD3D_SHADER_QUIRK_DEBUG_FORCE_MIN_WAVE64 (1ull << 39)
+
+/* f32tof16 and f16tof32 must preserve denorms.
+ * Turnip on 7xx chips cannot, so we may need soft-float in some rare cases
+ * where denorms really matter to visual output. */
+#define VKD3D_SHADER_QUIRK_FORCE_DENORM_LEGACY_FP16_CONVERSIONS (1ull << 40)
 
 typedef uint64_t vkd3d_shader_quirks_t;
 

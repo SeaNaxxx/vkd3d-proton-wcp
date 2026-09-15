@@ -34,6 +34,7 @@ enum vkd3d_application_feature_override
     VKD3D_APPLICATION_FEATURE_RDNA1_COMPATIBILITY = 1 << 5,
     VKD3D_APPLICATION_FEATURE_ASSUMES_STRICT_BYTE_ADDRESS_WRAP = 1 << 6,
     VKD3D_APPLICATION_FEATURE_BROKEN_WAVE128_REQUESTS = 1 << 7,
+    VKD3D_APPLICATION_FEATURE_REQUIRES_MIN16_DENORMS = 1 << 8
 };
 
 static enum vkd3d_application_feature_override vkd3d_application_feature_override;
@@ -78,10 +79,10 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     /* Elden Ring (1245620).
      * Game is really churny on committed memory allocations, and does not use NOT_ZEROED. Clearing works causes bubbles.
      * It seems to work just fine however to skip the clears. */
-    { VKD3D_STRING_COMPARE_EXACT, "eldenring.exe",
+    { VKD3D_STRING_COMPARE_APPID, "1245620",
             VKD3D_CONFIG_FLAG_INIT_STATIC(
                 .MEMORY_ALLOCATOR_SKIP_CLEAR = 1, .PIPELINE_LIBRARY_IGNORE_MISMATCH_DRIVER = 1,
-                .RECYCLE_COMMAND_POOLS = 1) },
+                .RECYCLE_COMMAND_POOLS = 1), VKD3D_CONFIG_FLAGS_NONE, VKD3D_APPLICATION_FEATURE_REQUIRES_MIN16_DENORMS },
     /* Serious Sam 4 (257420).
      * Invariant workarounds cause graphical glitches when rendering foliage on NV. */
     { VKD3D_STRING_COMPARE_EXACT, "Sam4.exe",
@@ -577,6 +578,16 @@ static const struct vkd3d_shader_quirk_info plague_tale_resonance_robustness_qui
     plague_tale_resonance_hashes, ARRAY_SIZE(plague_tale_resonance_hashes), 0,
 };
 
+static const struct vkd3d_shader_quirk_hash elden_ring_hashes[] = {
+    { "CS_WriteInScattering", 0, VKD3D_SHADER_QUIRK_FORCE_DENORM_LEGACY_FP16_CONVERSIONS },
+    { "CS_WriteLocalLight", 0, VKD3D_SHADER_QUIRK_FORCE_DENORM_LEGACY_FP16_CONVERSIONS },
+    { "CS_SolveVolumetricFog", 0, VKD3D_SHADER_QUIRK_FORCE_DENORM_LEGACY_FP16_CONVERSIONS },
+};
+
+static const struct vkd3d_shader_quirk_info elden_ring_quirks = {
+    elden_ring_hashes, ARRAY_SIZE(elden_ring_hashes), 0,
+};
+
 static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* F1 2020 (1080110) */
     { VKD3D_STRING_COMPARE_EXACT, "F1_2020_dx12.exe", &f1_2019_2020_quirks },
@@ -681,6 +692,8 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     { VKD3D_STRING_COMPARE_EXACT, "MONSTER_HUNTER_STORIES_3_TWISTED_REFLECTION.exe", &re_engine_quirks },
     /* Dragon's Dogma 2 (2054970) */
     { VKD3D_STRING_COMPARE_EXACT, "DD2.exe", &re_engine_quirks },
+    /* Elden Ring (1245620) */
+    { VKD3D_STRING_COMPARE_APPID, "1245620", &elden_ring_quirks },
     /* Unreal Engine 4 */
     { VKD3D_STRING_COMPARE_ENDS_WITH, "-Shipping.exe", &ue4_quirks },
     { VKD3D_STRING_COMPARE_NEVER, NULL, NULL },
@@ -698,10 +711,16 @@ void vkd3d_instance_apply_application_workarounds(void)
     uint32_t engine_major = 0, engine_minor = 0, engine_patch = 0;
     enum vkd3d_application_engine_class engine_class;
     char app[VKD3D_PATH_MAX];
+    char appid[32];
     size_t i;
 
     if (!vkd3d_get_program_name(app))
         return;
+
+    if (vkd3d_get_env_var("SteamAppID", appid, sizeof(appid)))
+        INFO("Detected SteamAppID %s\n", appid);
+    else
+        appid[0] = '\0';
 
     if ((engine_class = vkd3d_get_engine_version(&engine_major, &engine_minor, &engine_patch)))
     {
@@ -741,7 +760,13 @@ void vkd3d_instance_apply_application_workarounds(void)
 
     for (i = 0; i < ARRAY_SIZE(application_override); i++)
     {
-        if (vkd3d_string_compare(application_override[i].mode, app, application_override[i].name))
+        bool match;
+        if (application_override[i].mode == VKD3D_STRING_COMPARE_APPID)
+            match = vkd3d_string_compare(VKD3D_STRING_COMPARE_EXACT, appid, application_override[i].name);
+        else
+            match = vkd3d_string_compare(application_override[i].mode, app, application_override[i].name);
+
+        if (match)
         {
             vkd3d_config_flag_global_add(application_override[i].global_flags_add);
             vkd3d_config_flag_global_remove(application_override[i].global_flags_remove);
@@ -780,7 +805,13 @@ void vkd3d_instance_apply_application_workarounds(void)
 
     for (i = 0; i < ARRAY_SIZE(application_shader_quirks); i++)
     {
-        if (vkd3d_string_compare(application_shader_quirks[i].mode, app, application_shader_quirks[i].name))
+        bool match;
+        if (application_shader_quirks[i].mode == VKD3D_STRING_COMPARE_APPID)
+            match = vkd3d_string_compare(VKD3D_STRING_COMPARE_EXACT, appid, application_shader_quirks[i].name);
+        else
+            match = vkd3d_string_compare(application_shader_quirks[i].mode, app, application_shader_quirks[i].name);
+
+        if (match)
         {
             vkd3d_shader_quirk_info_template = *application_shader_quirks[i].info;
             INFO("Detected game %s, adding shader quirks for specific shaders.\n", app);
@@ -1113,6 +1144,11 @@ bool d3d12_device_allow_emulated_barycentrics(struct d3d12_device* device)
 bool vkd3d_application_has_broken_wave128(void)
 {
     return (vkd3d_application_feature_override & VKD3D_APPLICATION_FEATURE_BROKEN_WAVE128_REQUESTS) != 0;
+}
+
+bool vkd3d_application_requires_min16_denorms(void)
+{
+    return (vkd3d_application_feature_override & VKD3D_APPLICATION_FEATURE_REQUIRES_MIN16_DENORMS) != 0;
 }
 
 VKD3D_DEBUG_CONTROL_BEHAVIOR_FLAGS vkd3d_debug_control_get_behavior_flags(void);
