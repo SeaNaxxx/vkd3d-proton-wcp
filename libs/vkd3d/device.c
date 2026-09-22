@@ -142,6 +142,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION_COND(EXT_DESCRIPTOR_HEAP, EXT_descriptor_heap, VKD3D_CONFIG_FLAG_STATIC(DESCRIPTOR_HEAP)),
     VK_EXTENSION_DISABLE_COND(EXT_RAY_TRACING_INVOCATION_REORDER, EXT_ray_tracing_invocation_reorder, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
     VK_EXTENSION(EXT_SHADER_LONG_VECTOR, EXT_shader_long_vector),
+    VK_EXTENSION(EXT_SHADER_ATOMIC_FLOAT, EXT_shader_atomic_float),
     /* AMD extensions */
     VK_EXTENSION(AMD_BUFFER_MARKER, AMD_buffer_marker),
     VK_EXTENSION(AMD_DEVICE_COHERENT_MEMORY, AMD_device_coherent_memory),
@@ -162,6 +163,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(NV_RAW_ACCESS_CHAINS, NV_raw_access_chains),
     VK_EXTENSION(NV_COOPERATIVE_MATRIX_2, NV_cooperative_matrix2),
     VK_EXTENSION_DISABLE_COND(NV_RAY_TRACING_INVOCATION_REORDER, NV_ray_tracing_invocation_reorder, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
+    VK_EXTENSION(NV_SHADER_ATOMIC_FLOAT16_VECTOR, NV_shader_atomic_float16_vector),
     /* VALVE extensions */
     VK_EXTENSION(VALVE_MUTABLE_DESCRIPTOR_TYPE, VALVE_mutable_descriptor_type),
     VK_EXTENSION(VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT, VALVE_shader_mixed_float_dot_product),
@@ -1817,6 +1819,18 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
     {
         info->untyped_pointers_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR;
         vk_prepend_struct(&info->features2, &info->untyped_pointers_features);
+    }
+
+    if (vulkan_info->NV_shader_atomic_float16_vector)
+    {
+        info->shader_atomic_float16_vector_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT16_VECTOR_FEATURES_NV;
+        vk_prepend_struct(&info->features2, &info->shader_atomic_float16_vector_features);
+    }
+
+    if (vulkan_info->EXT_shader_atomic_float)
+    {
+        info->shader_atomic_float_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+        vk_prepend_struct(&info->features2, &info->shader_atomic_float_features);
     }
 
     VK_CALL(vkGetPhysicalDeviceFeatures2(device->vk_physical_device, &info->features2));
