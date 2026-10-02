@@ -602,6 +602,14 @@ static const struct vkd3d_shader_quirk_info half_sword_quirks = {
     NULL, 0, VKD3D_SHADER_QUIRK_CLAMP_WAVE_SIZE_TO_THREAD_GROUP32,
 };
 
+static const struct vkd3d_shader_quirk_hash ac8_hashes[] = {
+    { "SkyTraceCS", 0, VKD3D_SHADER_QUIRK_FORCE_DENORM_LEGACY_FP16_CONVERSIONS },
+};
+
+static const struct vkd3d_shader_quirk_info ac8_quirks = {
+    ac8_hashes, ARRAY_SIZE(ac8_hashes), 0,
+};
+
 static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* F1 2020 (1080110) */
     { VKD3D_STRING_COMPARE_EXACT, "F1_2020_dx12.exe", &f1_2019_2020_quirks },
@@ -710,6 +718,8 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     { VKD3D_STRING_COMPARE_APPID, "1245620", &elden_ring_quirks },
     /* Half Sword (2397300) */
     { VKD3D_STRING_COMPARE_EXACT, "HalfSwordUE5-Win64-Shipping.exe", &half_sword_quirks },
+    /* ACE COMBAT 8 (2288340) */
+    { VKD3D_STRING_COMPARE_APPID, "2288340", &ac8_quirks },
     /* Unreal Engine 4 */
     { VKD3D_STRING_COMPARE_ENDS_WITH, "-Shipping.exe", &ue4_quirks },
     { VKD3D_STRING_COMPARE_NEVER, NULL, NULL },
@@ -1101,10 +1111,9 @@ void vkd3d_physical_device_info_apply_workarounds(struct vkd3d_physical_device_i
             device->device_info.present_timing_features.presentAtRelativeTime = VK_FALSE;
         }
 
-        if (!vkd3d_debug_control_is_test_suite() &&
-            info->vulkan_1_2_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
+        if (info->vulkan_1_2_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
         {
-            /* Float controls2 is broken where we need it to work. Keep using bad QuantizeToFP16 path
+            /* Float controls2 is broken where we need it to work. Keep using slow quantize path
              * until driver works. */
             WARN("Disabling shader_float_controls2 on NV drivers due to buggy implementation.\n");
             device->device_info.float_controls2_features.shaderFloatControls2 = VK_FALSE;
