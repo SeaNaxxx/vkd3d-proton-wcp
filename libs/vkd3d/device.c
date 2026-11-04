@@ -141,7 +141,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(EXT_DEPTH_BIAS_CONTROL, EXT_depth_bias_control),
     VK_EXTENSION(EXT_ZERO_INITIALIZE_DEVICE_MEMORY, EXT_zero_initialize_device_memory),
     VK_EXTENSION(EXT_SHADER_FLOAT8, EXT_shader_float8),
-    VK_EXTENSION_COND(EXT_DESCRIPTOR_HEAP, EXT_descriptor_heap, VKD3D_CONFIG_FLAG_STATIC(DESCRIPTOR_HEAP)),
+    VK_EXTENSION_DISABLE_COND(EXT_DESCRIPTOR_HEAP, EXT_descriptor_heap, VKD3D_CONFIG_FLAG_STATIC(NO_DESCRIPTOR_HEAP)),
     VK_EXTENSION_DISABLE_COND(EXT_RAY_TRACING_INVOCATION_REORDER, EXT_ray_tracing_invocation_reorder, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
     VK_EXTENSION(EXT_SHADER_LONG_VECTOR, EXT_shader_long_vector),
     VK_EXTENSION(EXT_SHADER_ATOMIC_FLOAT, EXT_shader_atomic_float),
@@ -7567,8 +7567,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_OpenExistingHeapFromAddress1(
 
     memset(&heap_desc, 0, sizeof(heap_desc));
     heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS |
-            (address ? (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) : 0);
+    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    if (address && device->vk_info.EXT_external_memory_host)
+        heap_desc.Flags |= D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER;
+    else if (address)
+        FIXME("Attempting to import host memory, but VK_EXT_external_memory_host is not supported. Falling back.\n");
     heap_desc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
     heap_desc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
     heap_desc.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;

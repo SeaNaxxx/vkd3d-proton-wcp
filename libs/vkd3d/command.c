@@ -14376,6 +14376,21 @@ static void d3d12_command_list_set_descriptor_heaps(struct d3d12_command_list *l
     /* Immediately bind the heap. This allows e.g. metacommands to more aggressively use the heap as intended. */
     list->descriptor_heap.buffers.global_heap_dirty = true;
     d3d12_command_list_update_global_descriptor_heap(list);
+
+    /* If we're invalidating the heap, descriptor table VAs set in root signatures are no longer valid,
+     * since they will point to a completely different heap.
+     * Resonance of Fate remaster seems to rely on the fact that parameters get reset to 0 or something like that.
+     * Only clear if we're invalidating the heap.
+     * Technically, if we're only partially invalidating the offsets by only changing e.g. resource heap,
+     * this is a theoretical hazard.
+     * https://learn.microsoft.com/en-us/windows/win32/direct3d12/setting-descriptor-heaps says:
+     * "Descriptor table state is undefined at the beginning of a command list and after descriptor heaps are changed on a command list.
+     * Redundantly setting the same descriptor heap does not cause descriptor table settings to be undefined."
+     * It is slightly unclear if the undefined-ness is tracked per type since "heap" is lacking a plural,
+     * but we make that assumption.
+     */
+    memset(list->graphics_bindings.descriptor_tables, 0, sizeof(list->graphics_bindings.descriptor_tables));
+    memset(list->compute_bindings.descriptor_tables, 0, sizeof(list->compute_bindings.descriptor_tables));
 }
 
 static void d3d12_command_list_set_descriptor_heaps_buffers(struct d3d12_command_list *list,
@@ -14433,6 +14448,9 @@ static void d3d12_command_list_set_descriptor_heaps_buffers(struct d3d12_command
      * We also need to invalidate any push descriptors. */
     d3d12_command_list_invalidate_root_parameters(list, &list->graphics_bindings, true, NULL);
     d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, NULL);
+
+    memset(list->graphics_bindings.descriptor_tables, 0, sizeof(list->graphics_bindings.descriptor_tables));
+    memset(list->compute_bindings.descriptor_tables, 0, sizeof(list->compute_bindings.descriptor_tables));
 }
 
 static void d3d12_command_list_set_descriptor_heaps_sets(struct d3d12_command_list *list,
@@ -14470,6 +14488,12 @@ static void d3d12_command_list_set_descriptor_heaps_sets(struct d3d12_command_li
 
     vkd3d_pipeline_bindings_set_dirty_sets(&list->graphics_bindings, dirty_mask);
     vkd3d_pipeline_bindings_set_dirty_sets(&list->compute_bindings, dirty_mask);
+
+    if (dirty_mask)
+    {
+        memset(list->graphics_bindings.descriptor_tables, 0, sizeof(list->graphics_bindings.descriptor_tables));
+        memset(list->compute_bindings.descriptor_tables, 0, sizeof(list->compute_bindings.descriptor_tables));
+    }
 }
 
 static void STDMETHODCALLTYPE d3d12_command_list_SetDescriptorHeaps(d3d12_command_list_iface *iface,
@@ -14488,6 +14512,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetDescriptorHeaps(d3d12_comman
         struct d3d12_descriptor_heap *heap = impl_from_ID3D12DescriptorHeap(heaps[i]);
         if (heap)
             d3d12_command_allocator_retain_descriptor_heap(list->allocator, heap);
+
+        VKD3D_BREADCRUMB_AUX64(heap->descriptor_buffer.va);
+        VKD3D_BREADCRUMB_AUX64(heap->desc.NumDescriptors);
+        VKD3D_BREADCRUMB_TAG(heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ? "CBV_SRV_UAV heap" : "SAMPLER heap");
     }
 
     if (d3d12_device_use_descriptor_heap(list->device))
@@ -18179,10 +18207,6 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
     {
         if (!d3d12_command_list_update_compute_pipeline(list))
             return;
-
-        /* Needed for workarounds later. */
-        if (!(list->vk_queue_flags & VK_QUEUE_GRAPHICS_BIT))
-            list->cmd.uses_dgc_compute_in_async_compute = true;
     }
     else
     {
@@ -24098,14 +24122,6 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
         if (cmd_list->debug_capture)
             sub.execute.debug_capture = true;
 
-        /* Submission logic for IB fallbacks seems to have exposed something ... very dodgy in RADV. */
-        if (cmd_list->cmd.uses_dgc_compute_in_async_compute &&
-                !VKD3D_CONFIG_FLAG_IS_SET(SKIP_DRIVER_WORKAROUNDS) &&
-                command_queue->device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_RADV)
-        {
-            sub.execute.split_submission = true;
-        }
-
 #ifdef VKD3D_ENABLE_BREADCRUMBS
         if (breadcrumb_indices)
             breadcrumb_indices[i] = cmd_list->breadcrumb_context_index;
@@ -25633,11 +25649,6 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
                 vkd3d_queue_release(command_queue->device->memory_transfers.vkd3d_queue);
                 WARN("Performing a fallback copy queue submit. Bad perf :(\n");
             }
-        }
-        else if (exec->split_submission)
-        {
-            vr = d3d12_command_queue_submit_split_locked(command_queue->device, vk_queue,
-                    num_submits, submit_desc);
         }
         else if ((vr = VK_CALL(vkQueueSubmit2(vk_queue, num_submits, submit_desc, VK_NULL_HANDLE))) < 0)
         {

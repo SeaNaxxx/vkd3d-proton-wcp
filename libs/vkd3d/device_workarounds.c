@@ -132,7 +132,7 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_STARTS_WITH, "ffxvi", VKD3D_CONFIG_FLAG_STATIC(FORCE_INITIAL_TRANSITION) },
     /* World of Warcraft retail. Broken MSAA code where it renders to multi-sampled target with single sampled PSO. */
     /* Descriptor type mismatches causes GPU hangs in a ray query shader without 64 byte descriptors */
-    { VKD3D_STRING_COMPARE_EXACT, "Wow.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(.FORCE_DYNAMIC_MSAA = 1, .AVOID_IMAGE_BUFFER_ALIASING = 1, .DESCRIPTOR_HEAP = 1) },
+    { VKD3D_STRING_COMPARE_EXACT, "Wow.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(.FORCE_DYNAMIC_MSAA = 1, .AVOID_IMAGE_BUFFER_ALIASING = 1) },
     /* The Last of Us Part I (1888930). Submits hundreds of command buffers per frame.
      * Some of the lighting shaders are extremely sensitive to tiling layouts, and using thin tiling for 3D UAVs has profound
      * performance effects. */
@@ -213,7 +213,7 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_EXACT, "AssettoCorsaEVO.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(.FORCE_RAW_VA_CBV = 1) },
     /* World of Warcraft Classic */
     /* Like in retail WoW, descriptor type mismatches causes GPU hangs in a ray query shader without 64 byte descriptors */
-    { VKD3D_STRING_COMPARE_EXACT, "WoWClassic.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(.AVOID_IMAGE_BUFFER_ALIASING = 1, .DESCRIPTOR_HEAP = 1) },
+    { VKD3D_STRING_COMPARE_EXACT, "WoWClassic.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(.AVOID_IMAGE_BUFFER_ALIASING = 1) },
     /* World of Warcraft Forever beta. Same MSAA issue as WoW Retail. */
     { VKD3D_STRING_COMPARE_EXACT, "WowB.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(.FORCE_DYNAMIC_MSAA = 1) },
     /* Teardown.
@@ -222,8 +222,6 @@ static const struct vkd3d_instance_application_meta application_override[] = {
      * template makes those ExecuteIndirect draws disappear, and the game handles a failed
      * CreateCommandSignature by issuing the draws from the CPU instead. */
     { VKD3D_STRING_COMPARE_EXACT, "teardown.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(.FAIL_UNSUPPORTED_STATE_TEMPLATE = 1) },
-    /* NBA 2K27 (4356430) */
-    { VKD3D_STRING_COMPARE_EXACT, "NBA2K27.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(.DESCRIPTOR_HEAP = 1) },
     /* Space Engineers 2 (1133870) */
     { VKD3D_STRING_COMPARE_EXACT, "SpaceEngineers2.exe", VKD3D_CONFIG_FLAGS_NONE, VKD3D_CONFIG_FLAGS_NONE, VKD3D_APPLICATION_FEATURE_ATTEMPTS_COMPLEX_MULTIVIEW },
     { VKD3D_STRING_COMPARE_NEVER, NULL },
@@ -284,13 +282,6 @@ static const struct vkd3d_shader_quirk_hash re_hashes[] = {
     { NULL, 0xa100b53736f9c1bfull, VKD3D_SHADER_QUIRK_FORCE_SUBGROUP_SIZE_1 },
     /* RE2 and RE7 */
     { NULL, 0x1c4c8782b75c498bull, VKD3D_SHADER_QUIRK_FORCE_SUBGROUP_SIZE_1 },
-    /* Temporary driver workaround for RADV. See https://gitlab.freedesktop.org/mesa/mesa/-/issues/9852. */
-    /* This shader trips on Mesa 23.0.3. */
-    { NULL, 0xdb1593ced60da3f1ull, VKD3D_SHADER_QUIRK_REWRITE_GRAD_TO_BIAS },
-    /* This shader hangs on Mesa main. */
-    { NULL, 0x5784e9e2f7a76819ull, VKD3D_SHADER_QUIRK_REWRITE_GRAD_TO_BIAS },
-    /* This shader hangs on RDNA1 */
-    { NULL, 0x7b3cec4ba6d32cacull, VKD3D_SHADER_QUIRK_REWRITE_GRAD_TO_BIAS },
 };
 
 static const struct vkd3d_shader_quirk_info re_quirks = {
@@ -349,17 +340,6 @@ static const struct vkd3d_shader_quirk_hash ac_mirage_hashes[] = {
 
 static const struct vkd3d_shader_quirk_info ac_mirage_quirks = {
     ac_mirage_hashes, ARRAY_SIZE(ac_mirage_hashes), 0,
-};
-
-static const struct vkd3d_shader_quirk_hash ffxvi_hashes[] = {
-    /* On RADV 24.1.6 RDNA3, we seem to be plagued with a compiler bug/hardware quirk.
-     * It works on main, but only by chance.
-     * https://gitlab.freedesktop.org/mesa/mesa/-/issues/11738. */
-    { NULL, 0xa98606e01cdd5924, VKD3D_SHADER_QUIRK_DISABLE_OPTIMIZATIONS },
-};
-
-static const struct vkd3d_shader_quirk_info ffxvi_quirks = {
-    ffxvi_hashes, ARRAY_SIZE(ffxvi_hashes),
 };
 
 /* Some shaders use precise, some don't, leading to invariance issues. */
@@ -576,7 +556,7 @@ static const struct vkd3d_shader_quirk_info wow_classic_quirks = {
     wow_classic_hashes, ARRAY_SIZE(wow_classic_hashes), 0,
 };
 
-static const struct vkd3d_shader_quirk_info empire_of_the_ants_quirks = {
+static const struct vkd3d_shader_quirk_info global_wave32_quirks = {
     NULL, 0, VKD3D_SHADER_QUIRK_CLAMP_WAVE_SIZE_TO_THREAD_GROUP32,
 };
 
@@ -608,14 +588,6 @@ static const struct vkd3d_shader_quirk_hash elden_ring_hashes[] = {
 
 static const struct vkd3d_shader_quirk_info elden_ring_quirks = {
     elden_ring_hashes, ARRAY_SIZE(elden_ring_hashes), 0,
-};
-
-static const struct vkd3d_shader_quirk_info half_sword_quirks = {
-    NULL, 0, VKD3D_SHADER_QUIRK_CLAMP_WAVE_SIZE_TO_THREAD_GROUP32,
-};
-
-static const struct vkd3d_shader_quirk_info arc_raiders_quirks = {
-    NULL, 0, VKD3D_SHADER_QUIRK_CLAMP_WAVE_SIZE_TO_THREAD_GROUP32,
 };
 
 static const struct vkd3d_shader_quirk_hash ac8_hashes[] = {
@@ -652,8 +624,6 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* AC: Mirage */
     { VKD3D_STRING_COMPARE_EXACT, "ACMirage.exe", &ac_mirage_quirks },
     { VKD3D_STRING_COMPARE_EXACT, "ACMirage_plus.exe", &ac_mirage_quirks },
-    /* FF XVI. */
-    { VKD3D_STRING_COMPARE_STARTS_WITH, "ffxvi", &ffxvi_quirks },
     /* Hunt: Showdown 1896 (594650) */
     { VKD3D_STRING_COMPARE_EXACT, "HuntGame.exe", &hunt_quirks },
     /* Dragon Age: The Veilguard (1845910) */
@@ -721,7 +691,7 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     { VKD3D_STRING_COMPARE_EXACT, "Resonance.exe", &plague_tale_resonance_robustness_quirks },
     /* Empire of the Ants (2287330). With Terrain Tessellation on, some shaders
      * seem to assume Wave32 by mistake leading to GPU timeout. */
-    { VKD3D_STRING_COMPARE_EXACT, "Empire-Win64-Shipping.exe", &empire_of_the_ants_quirks },
+    { VKD3D_STRING_COMPARE_EXACT, "Empire-Win64-Shipping.exe", &global_wave32_quirks },
     /* 007: First Light (3768760) */
     { VKD3D_STRING_COMPARE_EXACT, "007FirstLight.exe", &first_light_quirks },
     /* Resident Evil Requiem (3764200) */
@@ -733,11 +703,13 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* Elden Ring (1245620) */
     { VKD3D_STRING_COMPARE_APPID, "1245620", &elden_ring_quirks },
     /* Half Sword (2397300) */
-    { VKD3D_STRING_COMPARE_EXACT, "HalfSwordUE5-Win64-Shipping.exe", &half_sword_quirks },
+    { VKD3D_STRING_COMPARE_EXACT, "HalfSwordUE5-Win64-Shipping.exe", &global_wave32_quirks },
     /* ARC Raiders (1808500) */
-    { VKD3D_STRING_COMPARE_STARTS_WITH, "PioneerGame", &arc_raiders_quirks },
+    { VKD3D_STRING_COMPARE_STARTS_WITH, "PioneerGame", &global_wave32_quirks },
     /* ACE COMBAT 8 (2288340) */
     { VKD3D_STRING_COMPARE_APPID, "2288340", &ac8_quirks },
+    /* STAR WARS: Galactic Racer (4078430) */
+    { VKD3D_STRING_COMPARE_EXACT, "SWGR-Win64-Shipping.exe", &global_wave32_quirks },
     /* Unreal Engine 4 */
     { VKD3D_STRING_COMPARE_ENDS_WITH, "-Shipping.exe", &ue4_quirks },
     { VKD3D_STRING_COMPARE_NEVER, NULL, NULL },
@@ -932,13 +904,9 @@ void vkd3d_instance_deduce_config_flags_from_environment(void)
                     .EXTENDED_DEBUG_UTILS = 1));
     }
 
-    /* RADV_THREAD_TRACE_xxx are deprecated and will be removed at some point. */
-    if (vkd3d_get_env_var("RADV_THREAD_TRACE", env, sizeof(env)) ||
-            vkd3d_get_env_var("RADV_THREAD_TRACE_TRIGGER", env, sizeof(env)) ||
-            (vkd3d_get_env_var("MESA_VK_TRACE", env, sizeof(env)) &&
-                strcmp(env, "rgp") == 0))
+    if (vkd3d_get_env_var("MESA_VK_TRACE", env, sizeof(env)) && strcmp(env, "rgp") == 0)
     {
-        INFO("RADV thread trace is enabled. Forcing debug utils to be enabled for labels.\n");
+        INFO("Thread trace is enabled. Forcing debug utils to be enabled for labels.\n");
         /* Disable caching so we can get full debug information when emitting labels. */
         vkd3d_config_flag_global_add(VKD3D_CONFIG_FLAG_INIT(
                     .DEBUG_UTILS = 1,
@@ -957,7 +925,7 @@ void vkd3d_instance_apply_global_shader_quirks(void)
     struct override
     {
         union vkd3d_config_flags config;
-        uint32_t quirk;
+        vkd3d_shader_quirks_t quirk;
         bool negative;
     };
 
@@ -965,6 +933,7 @@ void vkd3d_instance_apply_global_shader_quirks(void)
     {
         { VKD3D_CONFIG_FLAG_STATIC(FORCE_NO_INVARIANT_POSITION), VKD3D_SHADER_QUIRK_INVARIANT_POSITION, true },
         { VKD3D_CONFIG_FLAG_STATIC(DESCRIPTOR_HEAP_ROBUSTNESS), VKD3D_SHADER_QUIRK_DESCRIPTOR_HEAP_ROBUSTNESS, false },
+        { VKD3D_CONFIG_FLAG_STATIC(LEGACY_STRUCTURIZER), VKD3D_SHADER_QUIRK_LEGACY_STRUCTURIZER, false },
     };
     bool eq_test;
     unsigned int i;
@@ -981,7 +950,7 @@ void vkd3d_instance_apply_global_shader_quirks(void)
         static const struct
         {
             unsigned int level;
-            uint32_t quirk;
+            vkd3d_shader_quirks_t quirk;
         } mapping[] = {
             { 4, VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_4 },
             { 8, VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_8 },
