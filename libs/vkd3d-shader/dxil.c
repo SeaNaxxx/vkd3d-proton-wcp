@@ -185,6 +185,11 @@ static dxil_spv_bool dxil_remap_inner(
 
             if (vkd3d_shader_binding_is_root_descriptor(binding))
             {
+                /* Can happen if dxil-spirv attempts to get a texel buffer fallback when sparse feedback is used.
+                 * If we map to a root descriptor, feedback is undefined, so reject the fallback. */
+                if (d3d_binding->kind == DXIL_SPV_RESOURCE_KIND_TYPED_BUFFER)
+                    return DXIL_SPV_FALSE;
+
                 if ((remap->shader_interface_flags & VKD3D_SHADER_INTERFACE_HEAP_LOWERING) &&
                     (descriptor_type == VKD3D_SHADER_DESCRIPTOR_TYPE_CBV ||
                         d3d_binding->kind == DXIL_SPV_RESOURCE_KIND_RT_ACCELERATION_STRUCTURE ||
@@ -1402,11 +1407,15 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
             }
         }
 
+        dxil_spv_converter_set_can_feed_rasterizer(converter,
+            compiler_args->last_pre_rasterization ? DXIL_SPV_TRUE : DXIL_SPV_FALSE);
+
         if (compiler_args->multiview.enable)
         {
             struct dxil_spv_option_view_instancing helper = {{ DXIL_SPV_OPTION_VIEW_INSTANCING }};
             helper.enabled = DXIL_SPV_TRUE;
-            helper.last_pre_rasterization_stage = compiler_args->multiview.last_pre_rasterization ?
+            /* Kinda obsolete now. */
+            helper.last_pre_rasterization_stage = compiler_args->last_pre_rasterization ?
                     DXIL_SPV_TRUE : DXIL_SPV_FALSE;
             /* TODO: If we have forced view instancing, we need to set this to UINT32_MAX. */
             /* TODO: If we dynamically cannot do view instancing, we need to set meta descriptors. */
