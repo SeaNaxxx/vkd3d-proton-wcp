@@ -4290,21 +4290,22 @@ static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags
             FIXME_ONCE("ReadFromSubresource may be buggy on host-visible images with ALLOW_SIMULTANEOUS_ACCESS | ALLOW_UNORDERED_ACCESS.\n");
     }
 
-    if ((flags & VKD3D_RESOURCE_COMMITTED) &&
-        device->device_info.memory_priority_features.memoryPriority &&
-        (desc->Flags & high_priority_resource_flags))
+    if ((flags & VKD3D_RESOURCE_COMMITTED) && device->device_info.memory_priority_features.memoryPriority)
     {
-        size_t resource_size = d3d12_resource_is_texture(object) ?
-            vkd3d_compute_resource_layouts_from_desc(device, &object->desc, NULL) :
-            object->desc.Width;
-        uint32_t adjust = vkd3d_get_priority_adjust(resource_size);
-
-        object->priority.d3d12priority = D3D12_RESIDENCY_PRIORITY_HIGH | adjust;
-
-        if (device->device_info.pageable_device_memory_features.pageableDeviceLocalMemory)
+        if (desc->Flags & high_priority_resource_flags)
         {
-            if (object->heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT)
-                object->priority.residency_count = 0;
+            size_t resource_size = d3d12_resource_is_texture(object) ?
+                vkd3d_compute_resource_layouts_from_desc(device, &object->desc, NULL) :
+                object->desc.Width;
+            uint32_t adjust = vkd3d_get_priority_adjust(resource_size);
+
+            object->priority.d3d12priority = D3D12_RESIDENCY_PRIORITY_HIGH | adjust;
+        }
+
+        if (device->device_info.pageable_device_memory_features.pageableDeviceLocalMemory &&
+            (object->heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT))
+        {
+            object->priority.residency_count = 0;
         }
     }
 
@@ -5479,13 +5480,23 @@ static DXGI_FORMAT vkd3d_structured_srv_to_texel_buffer_dxgi_format(unsigned int
     /* If AMD reads a structured buffer as a texel buffer, it's effectively
      * the same stride that is read. NV seems to use the largest texel buffer type
      * that cleanly subdivides the large stride. For strides <= 16, this is easy,
-     * but for strides > 16, it gets a little more complicated. */
+     * but for strides > 16, it gets a little more complicated.
+     * However, if we need to read an SSBO as a texel buffer (sparse feedback on SSBO is a possible case),
+     * this will not work, since we expect it to be 32-bit.
+     * Descriptor heap for NV is effectively purely R32_UINT alias too.
+     * We cannot get perfect match with native, so do the simple thing we used to do.
+     * To enable this path again, we'd need some mechanism to teach dxil-spirv about the texel buffer type mapping first.
+     */
+
+#if 0
     if ((stride & 15) == 0)
         return DXGI_FORMAT_R32G32B32A32_UINT;
     if (stride % 12 == 0)
         return DXGI_FORMAT_R32G32B32_UINT;
     if ((stride & 7) == 0)
         return DXGI_FORMAT_R32G32_UINT;
+#endif
+
     if ((stride & 3) == 0)
         return DXGI_FORMAT_R32_UINT;
 
